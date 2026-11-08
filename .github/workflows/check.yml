@@ -1,0 +1,43 @@
+name: Check and build Windows app
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --only-binary=:all: -r requirements.txt pytest
+      - run: python -m pytest -q
+  windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --only-binary=:all: -r requirements.txt pyinstaller==6.16.0
+      - name: Build portable folder
+        run: python -m PyInstaller --noconfirm --clean --onedir --console --name MeshRepair --collect-all meshlib --hidden-import meshrepair.worker launch.py
+      - name: Check packaged native worker
+        run: python tests/check_bundle.py dist/MeshRepair/MeshRepair.exe
+      - name: Include instructions and license notices
+        shell: cmd
+        run: |
+          copy README.md dist\MeshRepair\README.md
+          copy THIRD_PARTY.md dist\MeshRepair\THIRD_PARTY.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MeshRepair-0.1.0-windows-x64
+          path: dist/MeshRepair/
+          retention-days: 30
