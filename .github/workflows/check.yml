@@ -20,6 +20,9 @@ jobs:
           python -m pip install --only-binary=:all: -r requirements.txt pytest
       - run: python -m pytest -q
   windows:
+    defaults:
+      run:
+        shell: cmd
     needs: test
     runs-on: windows-latest
     steps:

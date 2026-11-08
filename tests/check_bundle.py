@@ -7,6 +7,8 @@ import tempfile
 from meshlib import mrmeshpy as mm
 
 if __name__ == '__main__':
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     executable = str(Path(sys.argv[1]).resolve())
     with tempfile.TemporaryDirectory() as folder:
         source = Path(folder) / 'cube.stl'
