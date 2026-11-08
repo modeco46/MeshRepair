@@ -16,7 +16,7 @@ if __name__ == '__main__':
         source = Path(folder) / 'cube.stl'
         target = Path(folder) / 'result.stl'
         mm.saveMesh(mm.makeCube(mm.Vector3f(.1, .1, .1)), source)
-        p = subprocess.run([executable, '--worker', str(source), '--output', str(target), '--device', 'cpu'],
+        p = subprocess.run([executable, '--worker', str(source), '--output', str(target), '--quality', '.02'],
                            capture_output=True, encoding='utf-8', errors='replace', timeout=180)
         print(p.stdout)
         print(p.stderr)
@@ -25,3 +25,20 @@ if __name__ == '__main__':
         report = json.loads(Path(str(target) + '.json').read_text(encoding='utf-8'))
         assert report['after']['closed']
         assert report['after']['components'] == 1
+
+        damaged = mm.Mesh()
+        for i in range(40):
+            part = mm.makeCube(mm.Vector3f(.1, .1, .1), mm.Vector3f(i * .2, 0, 0))
+            part.topology.deleteFace(mm.FaceId(0))
+            damaged.addMesh(part)
+        mm.saveMesh(damaged, source)
+        target = Path(folder) / 'sparse.stl'
+        p = subprocess.run([executable, '--worker', str(source), '--output', str(target), '--quality', '.02'],
+                           capture_output=True, encoding='utf-8', errors='replace', timeout=180)
+        print(p.stdout)
+        print(p.stderr)
+        assert p.returncode == 0
+        report = json.loads(Path(str(target) + '.json').read_text(encoding='utf-8'))
+        assert report['algorithm'] == 'sparse_openvdb_winding'
+        assert report['after']['closed']
+        assert report['after']['self_intersecting_faces'] == 0

@@ -1,4 +1,4 @@
-"""Small Russian desktop UI. Heavy work never runs on the Tk thread."""
+"""One file, one quality setting, Repair and Stop. Native work is isolated."""
 import json
 import os
 from pathlib import Path
@@ -6,6 +6,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from .engine import Settings
@@ -14,198 +15,162 @@ from .engine import Settings
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("MeshRepair 0.2 — проверочная версия")
-        root.geometry("900x780")
+        root.title('MeshRepair 0.3')
+        root.geometry('850x560')
+        root.minsize(680, 440)
         self.process = None
         self.events = queue.Queue()
         self.finished = False
-        panel = ttk.Frame(root, padding=16)
-        panel.pack(fill="both", expand=True)
-        self.source = tk.StringVar()
-        self.target = tk.StringVar()
-        self.tolerance = tk.StringVar(value="0.01")
-        self.device = tk.StringVar(value="Авто")
-        self.method = tk.StringVar(value="Бережный")
-        self.hole = tk.StringVar(value="1.0")
-        self.timeout = tk.StringVar(value="180")
+        self.stopping = False
         self.started = 0
-        self.deadline_seconds = 180
-        self.single = tk.BooleanVar(value=True)
-        self.units = tk.BooleanVar(value=False)
-        for label, variable, command in [("Исходная сетка", self.source, self.pick_source),
-                                          ("Новый файл STL", self.target, self.pick_target)]:
-            ttk.Label(panel, text=label).pack(anchor="w")
-            row = ttk.Frame(panel)
-            row.pack(fill="x", pady=(3, 10))
-            ttk.Entry(row, textvariable=variable).pack(side="left", fill="x", expand=True)
-            ttk.Button(row, text="Выбрать…", command=command).pack(side="right", padx=(8, 0))
+        panel = ttk.Frame(root, padding=18)
+        panel.pack(fill='both', expand=True)
+        ttk.Label(panel, text='Исходная сетка').pack(anchor='w')
         row = ttk.Frame(panel)
-        row.pack(fill="x", pady=6)
-        ttk.Label(row, text="Целевой допуск, мм:").pack(side="left")
-        ttk.Combobox(row, textvariable=self.tolerance, width=10,
-                     values=["0.001", "0.002", "0.005", "0.01", "0.02"]).pack(side="left", padx=8)
-        ttk.Label(row, text="Вычисления:").pack(side="left", padx=(18, 0))
-        ttk.Combobox(row, textvariable=self.device, state="readonly", width=12,
-                     values=["Авто", "CPU", "CUDA"]).pack(side="left", padx=8)
-        opts = ttk.Frame(panel)
-        opts.pack(fill="x", pady=6)
-        ttk.Label(opts, text="Метод:").pack(side="left")
-        ttk.Combobox(opts, textvariable=self.method, state="readonly", width=22,
-                     values=["Бережный", "Объединение тел", "Воксельный"]).pack(side="left", padx=6)
-        ttk.Label(opts, text="Периметр дыр ≤ мм:").pack(side="left")
-        ttk.Entry(opts, textvariable=self.hole, width=7).pack(side="left", padx=6)
-        ttk.Label(opts, text="Лимит времени, с:").pack(side="left")
-        ttk.Entry(opts, textvariable=self.timeout, width=7).pack(side="left", padx=6)
-        ttk.Checkbutton(panel, text="Требовать одну связную оболочку", variable=self.single).pack(anchor="w")
-        ttk.Checkbutton(panel, text="Подтверждаю: координаты файла заданы в миллиметрах",
-                        variable=self.units).pack(anchor="w", pady=5)
-        ttk.Label(panel, wraplength=840, text=(
-            "Бережный метод сохраняет исправные поверхности. Объединение тел удаляет внутренние полости. "
-            "Раздельные тела не соединяются перемычками автоматически. CUDA — только для воксельного метода. "
-            "Допуск 0,001–0,02 мм — целевой, оценка по вершинам не гарантирует точность всей поверхности. "
-            "Лимит 100 млн ячеек действует только для вокселей.")).pack(anchor="w", pady=8)
-        buttons = ttk.Frame(panel)
-        buttons.pack(fill="x", pady=8)
-        self.analyze = ttk.Button(buttons, text="Проверить сетку", command=lambda: self.start(False))
-        self.analyze.pack(side="left")
-        self.repair = ttk.Button(buttons, text="Построить кандидата", command=lambda: self.start(True))
-        self.repair.pack(side="left", padx=8)
-        self.cancel_button = ttk.Button(buttons, text="Отмена", command=self.cancel, state="disabled")
-        self.cancel_button.pack(side="left")
-        self.progress = ttk.Progressbar(panel, mode="indeterminate")
-        self.progress.pack(fill="x", pady=6)
-        self.log = tk.Text(panel, height=19, wrap="word", state="disabled")
-        self.log.pack(fill="both", expand=True)
-        root.protocol("WM_DELETE_WINDOW", self.close)
-        root.after(100, self.poll)
+        row.pack(fill='x', pady=(5, 14))
+        self.source = tk.StringVar()
+        self.source_entry = ttk.Entry(row, textvariable=self.source)
+        self.source_entry.pack(side='left', fill='x', expand=True)
+        self.browse = ttk.Button(row, text='Выбрать файл…', command=self.pick_source)
+        self.browse.pack(side='left', padx=(8, 0))
+        row = ttk.Frame(panel)
+        row.pack(fill='x', pady=5)
+        ttk.Label(row, text='Качество, мм:').pack(side='left')
+        self.quality = tk.StringVar(value='0.02')
+        self.quality_entry = ttk.Combobox(row, textvariable=self.quality, width=10,
+            values=['0.001', '0.005', '0.01', '0.02', '0.05', '0.1', '0.2', '0.5'])
+        self.quality_entry.pack(side='left', padx=8)
+        ttk.Label(row, text='Меньше — подробнее, больше — быстрее.').pack(side='left', padx=8)
+        ttk.Label(panel, wraplength=780, text=(
+            'Единицы: миллиметры. Результат сохраняется рядом с исходником в новый STL. '
+            'Исходный файл не изменяется.')).pack(anchor='w', pady=(7, 10))
+        row = ttk.Frame(panel)
+        row.pack(fill='x', pady=8)
+        self.repair = ttk.Button(row, text='Исправить', command=self.start)
+        self.repair.pack(side='left')
+        self.stop_button = ttk.Button(row, text='Остановить', command=self.cancel, state='disabled')
+        self.stop_button.pack(side='left', padx=8)
+        self.elapsed = tk.StringVar(value='')
+        ttk.Label(row, textvariable=self.elapsed).pack(side='right')
+        self.status = tk.StringVar(value='Выберите файл и нажмите «Исправить».')
+        ttk.Label(panel, textvariable=self.status, wraplength=780).pack(anchor='w', pady=(6, 4))
+        self.progress = ttk.Progressbar(panel, mode='determinate', maximum=100)
+        self.progress.pack(fill='x', pady=(0, 12))
+        self.log = tk.Text(panel, height=16, wrap='word', state='disabled')
+        self.log.pack(fill='both', expand=True)
+        root.protocol('WM_DELETE_WINDOW', self.close)
+        self.poll_id = root.after(100, self.poll)
 
     def write(self, text):
-        self.log.configure(state="normal")
-        self.log.insert("end", text + "\n")
-        self.log.see("end")
-        self.log.configure(state="disabled")
+        self.log.configure(state='normal')
+        self.log.insert('end', text + '\n')
+        self.log.see('end')
+        self.log.configure(state='disabled')
 
     def pick_source(self):
-        path = filedialog.askopenfilename(filetypes=[("Сетка", "*.stl *.obj *.ply")])
+        path = filedialog.askopenfilename(filetypes=[('Сетка', '*.stl *.obj *.ply')])
         if path:
             self.source.set(path)
-            self.target.set(str(Path(path).with_name(Path(path).stem + "_candidate.stl")))
 
-    def pick_target(self):
-        path = filedialog.asksaveasfilename(defaultextension=".stl", filetypes=[("STL", "*.stl")])
-        if path:
-            self.target.set(path)
+    def busy(self, value):
+        state = 'disabled' if value else 'normal'
+        for widget in (self.source_entry, self.browse, self.quality_entry, self.repair):
+            widget.configure(state=state)
+        self.stop_button.configure(state='normal' if value else 'disabled')
 
-    def start(self, repair):
+    def start(self):
         if self.process:
             return
         try:
-            value = float(self.tolerance.get().replace(",", "."))
-            hole = float(self.hole.get().replace(",", "."))
-            Settings(tolerance_mm=value, max_hole_perimeter_mm=hole).validate()
-            timeout = float(self.timeout.get())
-            import math
-            if not math.isfinite(timeout) or not 1 <= timeout <= 86400:
-                raise ValueError("Лимит времени: от 1 до 86400 секунд.")
-            self.deadline_seconds = timeout
-            if not self.units.get():
-                raise ValueError("Подтвердите единицы измерения — миллиметры.")
+            value = float(self.quality.get().replace(',', '.'))
+            Settings(value).validate()
             if not Path(self.source.get()).is_file():
-                raise ValueError("Выберите исходную сетку.")
-            if repair and (not self.target.get() or Path(self.target.get()).exists()):
-                raise ValueError("Выберите новое имя выходного файла.")
-            if getattr(sys, "frozen", False):
-                command = [sys.executable, "--worker"]
-            else:
-                command = [sys.executable, "-u", "-m", "meshrepair.worker"]
-            command += [self.source.get(), "--tolerance", str(value), "--device",
-                        {"Авто": "auto", "CPU": "cpu", "CUDA": "cuda"}[self.device.get()]]
-            command += ["--method", {"Бережный": "surface", "Объединение тел": "union", "Воксельный": "voxel"}[self.method.get()],
-                        "--max-hole-perimeter", str(hole)]
-            if repair:
-                command += ["--output", self.target.get()]
-            if not self.single.get():
-                command += ["--allow-components"]
-            env = dict(os.environ, PYTHONIOENCODING="utf-8")
+                raise ValueError('Выберите исходную сетку.')
+            command = ([sys.executable, '--worker'] if getattr(sys, 'frozen', False)
+                       else [sys.executable, '-u', '-m', 'meshrepair.worker'])
+            command += [self.source.get(), '--quality', str(value)]
             self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", errors="replace", env=env,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+                text=True, encoding='utf-8', errors='replace', env=dict(os.environ, PYTHONIOENCODING='utf-8'),
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
         except Exception as exc:
-            messagebox.showerror("Ошибка запуска", str(exc))
+            messagebox.showerror('Ошибка запуска', str(exc))
             return
-        self.finished = False
-        import time
+        self.finished = self.stopping = False
         self.started = time.monotonic()
-        self.analyze.configure(state="disabled")
-        self.repair.configure(state="disabled")
-        self.cancel_button.configure(state="normal")
-        self.progress.start()
-        self.write("\nЗапуск обработки…")
+        self.busy(True)
+        self.progress['value'] = 0
+        self.status.set('Запуск…')
+        self.write('\nИсправление: ' + self.source.get())
         threading.Thread(target=self.read_worker, args=(self.process,), daemon=True).start()
 
     def read_worker(self, process):
         for line in process.stdout:
             self.events.put(line.rstrip())
         process.stdout.close()
-        self.events.put({"exit": process.wait()})
+        self.events.put({'exit': process.wait()})
 
     def poll(self):
-        import time
-        if self.process and self.process.poll() is None and time.monotonic() - self.started > self.deadline_seconds:
-            self.write(f"Лимит {self.deadline_seconds:g} с исчерпан. Процесс останавливается; это не гарантия завершения ремонта.")
-            self.cancel()
+        if self.process:
+            seconds = int(time.monotonic() - self.started)
+            self.elapsed.set(f'{seconds // 60}:{seconds % 60:02d}')
         try:
             while True:
                 event = self.events.get_nowait()
                 if isinstance(event, dict):
-                    if not self.finished:
-                        self.write(f"Процесс завершён без результата (код {event['exit']}).")
+                    if self.stopping and not self.finished:
+                        self.status.set('Остановлено пользователем.')
+                        self.write('Остановлено. Исходный файл не изменён.')
+                    elif not self.finished:
+                        self.status.set('Процесс завершился без результата.')
+                        self.write(f'Процесс завершился (код {event["exit"]}). Возможна ошибка нативной библиотеки или нехватка памяти.')
                     self.process = None
-                    self.progress.stop()
-                    self.analyze.configure(state="normal")
-                    self.repair.configure(state="normal")
-                    self.cancel_button.configure(state="disabled")
+                    self.busy(False)
                     continue
                 try:
                     item = json.loads(event)
                 except ValueError:
                     self.write(event)
                     continue
-                if item["type"] == "result":
+                if not isinstance(item, dict) or 'type' not in item:
+                    self.write(event)
+                    continue
+                kind, value = item['type'], item.get('value')
+                if kind == 'progress' and not self.stopping:
+                    self.progress['value'] = value['percent']
+                    self.status.set(f"{value['percent']}% — {value['stage']}")
+                elif kind == 'result':
                     self.finished = True
-                    r = item["value"]
-                    for key, label in [("before", "До"), ("after", "После")]:
-                        if key in r:
-                            d = r[key]
-                            self.write(f"{label}: {d['triangles']:,} треугольников; "
-                                f"оболочек {d['components']}; дыр {d['boundary_loops']}; "
-                                f"пересекающихся граней {d['self_intersecting_faces']}; замкнута: {d['closed']}")
-                    if "output" in r:
-                        self.write(f"Отклонение по вершинам: {r['vertex_surface_deviation_mm']:.6g} мм")
-                        self.write("Оценка в пределах допуска." if r["sampled_tolerance_pass"] else
-                                   "ВНИМАНИЕ: оценка превышает заданный допуск!")
-                        self.write("Кандидат: " + r["output"] + "\nОтчёт: " + r["output"] + ".json")
-                    for warning in r["warnings"]:
+                    self.progress['value'] = 100
+                    self.status.set('Готово. Результат сохранён рядом с исходником.')
+                    d = value['after']
+                    self.write(f"Результат: {value['output']}")
+                    self.write(f"Треугольников: {d['triangles']:,}; замкнутых оболочек: {d['components']}; "
+                               f"дыр: {d['boundary_loops']}; пересекающихся граней: {d['self_intersecting_faces']}.")
+                    for warning in value['warnings']:
                         self.write(warning)
-                    self.write(f"Время: {r['elapsed_seconds']:.1f} с")
-                else:
-                    self.write(str(item["value"]))
-                    if item["type"] == "error":
-                        self.finished = True
+                    self.write(f"Время: {value['elapsed_seconds']:.1f} с. Подробности — в JSON рядом с STL.")
+                elif kind == 'error':
+                    self.finished = True
+                    self.status.set('Не удалось завершить исправление.')
+                    self.write(str(value))
+                elif kind == 'log':
+                    self.write(str(value))
         except queue.Empty:
             pass
-        self.root.after(100, self.poll)
+        self.poll_id = self.root.after(100, self.poll)
 
     def cancel(self):
-        if self.process and self.process.poll() is None:
+        if self.process and self.process.poll() is None and not self.stopping:
+            self.stopping = True
+            self.stop_button.configure(state='disabled')
+            self.status.set('Остановка…')
             self.process.terminate()
-            self.finished = True
-            self.write("Обработка отменена. Временные .meshrepair-* файлы можно удалить.")
 
     def close(self):
         self.cancel()
         if self.process:
             self.process.wait(timeout=10)
+        self.root.after_cancel(self.poll_id)
         self.root.destroy()
 
 

@@ -1,10 +1,11 @@
 import json
 import math
+from pathlib import Path
 import subprocess
 import sys
 import pytest
 from meshlib import mrmeshpy as mm
-from meshrepair.engine import Settings, grid_estimate, run
+from meshrepair.engine import Settings, Progress, output_path, run
 
 
 def cube(size=.1, base=0):
@@ -17,149 +18,125 @@ def save(tmp_path, mesh):
     return path
 
 
-@pytest.mark.parametrize('tolerance', [0, .0009, .021, math.inf, math.nan])
-def test_reject_invalid_tolerance(tolerance):
+@pytest.mark.parametrize('quality', [0, .0009, .501, math.inf, math.nan])
+def test_quality_validation(quality):
     with pytest.raises(ValueError):
-        Settings(tolerance_mm=tolerance).validate()
+        Settings(quality).validate()
 
 
-def test_budget_rejects_before_allocation(tmp_path):
+@pytest.mark.parametrize('quality', [.001, .02, .1, .5])
+def test_valid_quality(quality):
+    Settings(quality).validate()
+
+
+def test_valid_large_mesh_no_voxel_budget(tmp_path):
     source = save(tmp_path, cube(40))
-    out = tmp_path / 'result.stl'
-    with pytest.raises(ValueError, match='ячеек'):
-        run(source, out, Settings(device='cpu', method='voxel'))
-    assert not out.exists()
-    assert grid_estimate([40, 40, 40], .001)['cells'] > 64_000_000_000_000
-
-
-def test_analysis_does_not_create_result(tmp_path):
-    report = run(save(tmp_path, cube()))
-    assert report['before']['closed']
-    assert report['before']['components'] == 1
-    assert report['status'] == 'analysis_only'
-    assert not report['tolerance_certified']
-
-
-def test_rebuild_and_report(tmp_path):
-    source = save(tmp_path, cube())
     original = source.read_bytes()
-    target = tmp_path / 'result.stl'
-    report = run(source, target, Settings(device='cpu'))
-    assert target.is_file()
+    report = run(source, settings=Settings(.001))
+    assert report['after']['triangles'] == 12
     assert report['after']['closed']
-    assert report['after']['self_intersecting_faces'] == 0
-    assert report['after']['components'] == 1
-    assert report['after']['signed_volume_mm3'] > 0
-    assert report['vertex_surface_deviation_mm'] >= 0
-    assert not report['tolerance_certified']
+    assert report['algorithm'] == 'surface_repair'
     assert source.read_bytes() == original
-    assert json.loads((tmp_path / 'result.stl.json').read_text(encoding='utf-8'))['output'] == str(target)
-    reloaded = mm.loadMesh(target)
-    assert reloaded.topology.isClosed()
+    assert not report['tolerance_certified']
+    assert Path(report['output']).name == 'input_repaired.stl'
+    assert json.loads(Path(report['output'] + '.json').read_text(encoding='utf-8'))['status'] == 'repaired'
 
 
-def test_no_overwrite(tmp_path):
+def test_no_overwrite_and_auto_names(tmp_path):
     source = save(tmp_path, cube())
-    with pytest.raises(ValueError, match='перезапись'):
-        run(source, source)
-    target = tmp_path / 'existing.stl'
-    target.write_bytes(b'keep me')
     with pytest.raises(ValueError):
-        run(source, target)
-    assert target.read_bytes() == b'keep me'
+        run(source, source)
+    first = run(source)
+    data = Path(first['output']).read_bytes()
+    assert output_path(source).name == 'input_repaired_1.stl'
+    second = run(source)
+    assert second['output'] != first['output']
+    assert Path(first['output']).read_bytes() == data
 
 
-def test_inverted_closed_shell(tmp_path):
+def test_reverse_normals(tmp_path):
     mesh = cube()
     mesh.topology.flipOrientation()
-    report = run(save(tmp_path, mesh), tmp_path / 'fixed.stl', Settings(device='cpu'))
+    report = run(save(tmp_path, mesh))
     assert report['after']['signed_volume_mm3'] > 0
-    assert report['after']['closed']
 
 
-def test_intersecting_shells(tmp_path):
+def test_overlapping_bodies_union(tmp_path):
     mesh = cube()
     mesh.addMesh(cube(base=.04))
-    report = run(save(tmp_path, mesh), tmp_path / 'union.stl', Settings(device='cpu', method='union'))
+    report = run(save(tmp_path, mesh))
     assert report['before']['self_intersecting_faces'] > 0
     assert report['after']['self_intersecting_faces'] == 0
     assert report['after']['components'] == 1
 
 
-def test_hole(tmp_path):
+def test_nested_bodies_union(tmp_path):
+    mesh = cube(1)
+    mesh.addMesh(cube(.2, .2))
+    report = run(save(tmp_path, mesh))
+    assert report['after']['components'] == 1
+    assert report['after']['signed_volume_mm3'] == pytest.approx(1, abs=1e-6)
+
+
+def test_disjoint_bodies_are_saved_without_invented_bridges(tmp_path):
     mesh = cube()
+    mesh.addMesh(cube(base=.3))
+    report = run(save(tmp_path, mesh))
+    assert report['after']['components'] == 2
+    assert report['status'] == 'repaired_multiple_shells'
+    assert any('перемычки' in x for x in report['warnings'])
+    assert Path(report['output']).is_file()
+
+
+def test_hole_not_blocked_by_perimeter(tmp_path):
+    mesh = cube(4)
     mesh.topology.deleteFace(mm.FaceId(0))
-    report = run(save(tmp_path, mesh), tmp_path / 'closed.stl', Settings(device='cpu'))
-    assert report['before']['boundary_loops'] > 0
+    report = run(save(tmp_path, mesh))
+    assert report['before']['boundary_loops'] == 1
     assert report['after']['closed']
 
 
-def test_separate_parts_are_not_silently_deleted(tmp_path):
-    mesh = cube()
-    mesh.addMesh(cube(base=.3))
-    source = save(tmp_path, mesh)
-    target = tmp_path / 'single.stl'
-    with pytest.raises(ValueError, match='отдельных замкнутых'):
-        run(source, target, Settings(device='cpu'))
-    assert not target.exists()
-    report = run(source, target, Settings(device='cpu', require_single_component=False))
-    assert report['after']['components'] == 2
+def test_1150_open_components_use_sparse_reconstruction(tmp_path):
+    mesh = mm.Mesh()
+    for index in range(1150):
+        part = cube(.04)
+        part.topology.deleteFace(mm.FaceId(0))
+        part.transform(mm.AffineXf3f.translation(mm.Vector3f(
+            (index % 10) * .08, ((index // 10) % 10) * .08, (index // 100) * .08)))
+        mesh.addMesh(part)
+    events = []
+    report = run(save(tmp_path, mesh), settings=Settings(.005), progress=events.append)
+    assert report['before']['components'] == 1150
+    assert report['before']['boundary_loops'] == 1150
+    assert report['algorithm'] == 'sparse_openvdb_winding'
+    assert report['after']['closed']
+    assert report['after']['self_intersecting_faces'] == 0
+    assert report['after']['components'] == 1150
+    assert events[-1]['percent'] == 100
+    assert [e['percent'] for e in events] == sorted(e['percent'] for e in events)
+    assert any(42 < e['percent'] < 78 for e in events)
 
 
-def test_cli_protocol(tmp_path):
+def test_progress_does_not_go_backwards():
+    events = []
+    p = Progress(events.append)
+    p.update(60, 'GPU')
+    p.update(42, 'CPU retry')
+    p.update(100, 'Done')
+    assert [e['percent'] for e in events] == [60, 60, 100]
+
+
+def test_cli_utf8_protocol(tmp_path):
     source = save(tmp_path, cube())
-    p = subprocess.run([sys.executable, '-m', 'meshrepair.worker', str(source)],
+    p = subprocess.run([sys.executable, '-m', 'meshrepair.worker', str(source), '--quality', '.5'],
                        capture_output=True, encoding='utf-8')
     assert p.returncode == 0, p.stderr
     events = [json.loads(line) for line in p.stdout.splitlines() if line.startswith('{')]
     assert events[-1]['type'] == 'result'
+    assert any(e['type'] == 'progress' and e['value']['percent'] == 100 for e in events)
 
 
-def test_large_volume_no_longer_requires_voxels(tmp_path):
-    source = save(tmp_path, cube(40))
-    report = run(source, tmp_path / 'surface.stl', Settings(tolerance_mm=.001))
-    assert report['after']['triangles'] == 12
-    assert report['geometry_unchanged']
-    assert report['vertex_surface_deviation_mm'] == 0
-    assert report['grid_estimate']['cells'] > 100_000_000
-
-
-def test_nested_shell_union_is_explicit(tmp_path):
-    mesh = cube(1)
-    inner = cube(.2, .2)
-    inner.topology.flipOrientation()  # a genuine hollow cavity
-    mesh.addMesh(inner)
-    source = save(tmp_path, mesh)
-    kept = run(source, tmp_path / 'hollow.stl', Settings(require_single_component=False))
-    assert kept['after']['components'] == 2
-    assert kept['after']['signed_volume_mm3'] == pytest.approx(.992, abs=1e-6)
-    union = run(source, tmp_path / 'solid.stl', Settings(method='union'))
-    assert union['after']['components'] == 1
-    assert union['after']['signed_volume_mm3'] == pytest.approx(1, abs=1e-6)
-    assert not union['sampled_tolerance_pass']  # deleted interior is intentionally reported
-
-
-def test_hole_size_limit_is_separate(tmp_path):
-    mesh = cube(4)
-    mesh.topology.deleteFace(mm.FaceId(0))
-    source = save(tmp_path, mesh)
-    with pytest.raises(ValueError, match='Периметр дыры'):
-        run(source, tmp_path / 'no.stl')
-    report = run(source, tmp_path / 'yes.stl', Settings(max_hole_perimeter_mm=20))
-    assert report['after']['closed']
-
-
-@pytest.mark.parametrize('inverted', [False, True])
-def test_voxel_method_still_available(tmp_path, inverted):
-    mesh = cube()
-    if inverted:
-        mesh.topology.flipOrientation()
-    report = run(save(tmp_path, mesh), tmp_path / 'voxel.stl', Settings(method='voxel', device='cpu'))
-    assert report['after']['closed']
-    assert report['after']['triangles'] > 12
-
-
-def test_cli_errors_are_readable(tmp_path):
+def test_cli_errors_no_traceback(tmp_path):
     p = subprocess.run([sys.executable, '-m', 'meshrepair.worker', str(tmp_path / 'missing.stl')],
                        capture_output=True, encoding='utf-8')
     assert p.returncode == 1

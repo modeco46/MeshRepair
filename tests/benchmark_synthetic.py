@@ -23,13 +23,13 @@ def main():
         output = Path(folder) / 'result.stl'
         mm.saveMesh(a, source)
         p = subprocess.run([sys.executable, '-m', 'meshrepair.worker', str(source), '--output', str(output),
-                            '--method', 'union', '--device', 'cpu', '--tolerance', '.001'],
+                            '--quality', '.001'],
                            capture_output=True, encoding='utf-8', timeout=180)
         if p.returncode:
             raise RuntimeError(p.stdout + p.stderr)
         report = json.loads(Path(str(output) + '.json').read_text(encoding='utf-8'))
         print(json.dumps({key: report[key] for key in ['before', 'after', 'elapsed_seconds',
-                         'vertex_surface_deviation_mm', 'sampled_tolerance_pass']}, indent=2))
+                         'algorithm', 'compute_device']}, indent=2))
 
 
 if __name__ == '__main__':
