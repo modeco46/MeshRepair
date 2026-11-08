@@ -14,8 +14,8 @@ from .engine import Settings
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("MeshRepair 0.1 — проверочная версия")
-        root.geometry("850x670")
+        root.title("MeshRepair 0.2 — проверочная версия")
+        root.geometry("900x780")
         self.process = None
         self.events = queue.Queue()
         self.finished = False
@@ -25,6 +25,11 @@ class App:
         self.target = tk.StringVar()
         self.tolerance = tk.StringVar(value="0.01")
         self.device = tk.StringVar(value="Авто")
+        self.method = tk.StringVar(value="Бережный")
+        self.hole = tk.StringVar(value="1.0")
+        self.timeout = tk.StringVar(value="180")
+        self.started = 0
+        self.deadline_seconds = 180
         self.single = tk.BooleanVar(value=True)
         self.units = tk.BooleanVar(value=False)
         for label, variable, command in [("Исходная сетка", self.source, self.pick_source),
@@ -42,13 +47,23 @@ class App:
         ttk.Label(row, text="Вычисления:").pack(side="left", padx=(18, 0))
         ttk.Combobox(row, textvariable=self.device, state="readonly", width=12,
                      values=["Авто", "CPU", "CUDA"]).pack(side="left", padx=8)
+        opts = ttk.Frame(panel)
+        opts.pack(fill="x", pady=6)
+        ttk.Label(opts, text="Метод:").pack(side="left")
+        ttk.Combobox(opts, textvariable=self.method, state="readonly", width=22,
+                     values=["Бережный", "Объединение тел", "Воксельный"]).pack(side="left", padx=6)
+        ttk.Label(opts, text="Периметр дыр ≤ мм:").pack(side="left")
+        ttk.Entry(opts, textvariable=self.hole, width=7).pack(side="left", padx=6)
+        ttk.Label(opts, text="Лимит времени, с:").pack(side="left")
+        ttk.Entry(opts, textvariable=self.timeout, width=7).pack(side="left", padx=6)
         ttk.Checkbutton(panel, text="Требовать одну связную оболочку", variable=self.single).pack(anchor="w")
         ttk.Checkbutton(panel, text="Подтверждаю: координаты файла заданы в миллиметрах",
                         variable=self.units).pack(anchor="w", pady=5)
-        ttk.Label(panel, wraplength=790, text=(
-            "Первая версия: диагностика и полное объёмное перестроение. Мелкие детали могут измениться. "
-            "Допуск проверяется только по вершинам — это не гарантия точности всей поверхности. "
-            "Исходный файл не изменяется. Лимит расчёта: 100 млн ячеек.")).pack(anchor="w", pady=8)
+        ttk.Label(panel, wraplength=840, text=(
+            "Бережный метод сохраняет исправные поверхности. Объединение тел удаляет внутренние полости. "
+            "Раздельные тела не соединяются перемычками автоматически. CUDA — только для воксельного метода. "
+            "Допуск 0,001–0,02 мм — целевой, оценка по вершинам не гарантирует точность всей поверхности. "
+            "Лимит 100 млн ячеек действует только для вокселей.")).pack(anchor="w", pady=8)
         buttons = ttk.Frame(panel)
         buttons.pack(fill="x", pady=8)
         self.analyze = ttk.Button(buttons, text="Проверить сетку", command=lambda: self.start(False))
@@ -86,7 +101,13 @@ class App:
             return
         try:
             value = float(self.tolerance.get().replace(",", "."))
-            Settings(tolerance_mm=value).validate()
+            hole = float(self.hole.get().replace(",", "."))
+            Settings(tolerance_mm=value, max_hole_perimeter_mm=hole).validate()
+            timeout = float(self.timeout.get())
+            import math
+            if not math.isfinite(timeout) or not 1 <= timeout <= 86400:
+                raise ValueError("Лимит времени: от 1 до 86400 секунд.")
+            self.deadline_seconds = timeout
             if not self.units.get():
                 raise ValueError("Подтвердите единицы измерения — миллиметры.")
             if not Path(self.source.get()).is_file():
@@ -99,6 +120,8 @@ class App:
                 command = [sys.executable, "-u", "-m", "meshrepair.worker"]
             command += [self.source.get(), "--tolerance", str(value), "--device",
                         {"Авто": "auto", "CPU": "cpu", "CUDA": "cuda"}[self.device.get()]]
+            command += ["--method", {"Бережный": "surface", "Объединение тел": "union", "Воксельный": "voxel"}[self.method.get()],
+                        "--max-hole-perimeter", str(hole)]
             if repair:
                 command += ["--output", self.target.get()]
             if not self.single.get():
@@ -111,6 +134,8 @@ class App:
             messagebox.showerror("Ошибка запуска", str(exc))
             return
         self.finished = False
+        import time
+        self.started = time.monotonic()
         self.analyze.configure(state="disabled")
         self.repair.configure(state="disabled")
         self.cancel_button.configure(state="normal")
@@ -125,6 +150,10 @@ class App:
         self.events.put({"exit": process.wait()})
 
     def poll(self):
+        import time
+        if self.process and self.process.poll() is None and time.monotonic() - self.started > self.deadline_seconds:
+            self.write(f"Лимит {self.deadline_seconds:g} с исчерпан. Процесс останавливается; это не гарантия завершения ремонта.")
+            self.cancel()
         try:
             while True:
                 event = self.events.get_nowait()

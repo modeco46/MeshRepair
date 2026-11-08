@@ -10,6 +10,8 @@ if __name__ == '__main__':
     if hasattr(sys.stdout, 'reconfigure'):
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     executable = str(Path(sys.argv[1]).resolve())
+    ui = subprocess.run([executable, '--smoke-ui'], capture_output=True, timeout=30)
+    assert ui.returncode == 0, ui.stderr
     with tempfile.TemporaryDirectory() as folder:
         source = Path(folder) / 'cube.stl'
         target = Path(folder) / 'result.stl'

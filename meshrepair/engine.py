@@ -14,10 +14,16 @@ class Settings:
     device: str = "auto"
     max_grid_cells: int = 100_000_000
     require_single_component: bool = True
+    method: str = "surface"
+    max_hole_perimeter_mm: float = 1.0
 
     def validate(self):
         if not math.isfinite(self.tolerance_mm) or not 0.001 <= self.tolerance_mm <= 0.02:
             raise ValueError("Допуск должен быть от 0,001 до 0,02 мм.")
+        if self.method not in {"surface", "union", "voxel"}:
+            raise ValueError("Неизвестный метод ремонта.")
+        if not math.isfinite(self.max_hole_perimeter_mm) or self.max_hole_perimeter_mm < 0:
+            raise ValueError("Периметр закрываемых дыр должен быть неотрицательным.")
         if self.device not in {"auto", "cpu", "cuda"}:
             raise ValueError("Неизвестный режим вычислений.")
         if not isinstance(self.max_grid_cells, int) or self.max_grid_cells < 1:
@@ -91,7 +97,7 @@ def run(source, destination=None, settings=Settings(), emit=lambda message: None
     mesh.transform(mm.AffineXf3f.translation(-center))
     step = settings.tolerance_mm / 2
     estimate = grid_estimate((box.size().x, box.size().y, box.size().z), step)
-    report = {"version": "0.1.0", "settings": asdict(settings), "source": str(source),
+    report = {"version": "0.2.0", "settings": asdict(settings), "source": str(source),
               "units": "mm_assumed", "voxel_step_mm": step,
               "grid_estimate": estimate, "tolerance_certified": False,
               "loader": {"skipped_faces": skipped.value, "duplicated_vertices": duplicated.value},
@@ -100,12 +106,73 @@ def run(source, destination=None, settings=Settings(), emit=lambda message: None
                            "Размер вокселя не гарантирует заданный допуск."]}
     emit("Проверка исходной сетки и самопересечений…")
     report["before"] = diagnostics(mesh, mm)
+    info = report["before"]
+    emit(f"Исходная сетка: {info['triangles']:,} треугольников, оболочек {info['components']}, "
+         f"дыр {info['boundary_loops']}, пересекающихся граней {info['self_intersecting_faces']}.")
     if target is None:
         report["status"] = "analysis_only"
         report["elapsed_seconds"] = time.monotonic() - started
         return report
     if skipped.value:
         raise ValueError(f"Загрузчик пропустил {skipped.value} граней. Автоматический ремонт остановлен.")
+    if settings.method == "voxel":
+        repaired = voxel_repair(mesh, mm, settings, estimate, step, report, emit)
+    else:
+        repaired = surface_repair(mesh, mm, settings, report, emit)
+    if repaired.topology.numValidFaces() == 0:
+        raise RuntimeError("Получена пустая поверхность; результат не сохранён.")
+    emit("Проверка результата…")
+    report["after"] = diagnostics(repaired, mm)
+    after = report["after"]
+    if after["components"] == 1 and after["closed"] and after["signed_volume_mm3"] < 0:
+        repaired.topology.flipOrientation()
+        after["signed_volume_mm3"] = repaired.volume()
+    valid = after["closed"] and after["topology_valid"] and after["self_intersecting_faces"] == 0
+    if settings.require_single_component:
+        valid = valid and after["components"] == 1
+    if after["closed"] and after["self_intersecting_faces"] == 0 and settings.require_single_component and after["components"] > 1:
+        raise ValueError(f"Осталось {after['components']} отдельных замкнутых оболочек. "
+                         "Без добавления перемычек раздельные тела не станут одной оболочкой. "
+                         "Для вложенных тел выберите «Объединение тел» (это удаляет внутренние полости), "
+                         "либо отключите требование одной оболочки. Результат не сохранён.")
+    if not valid:
+        raise RuntimeError("Результат не прошёл проверку замкнутости/пересечений/связности; не сохранён. "
+                           + json.dumps(after, ensure_ascii=False))
+    emit("Оценка отклонений по вершинам в обе стороны…")
+    original_part, result_part = mm.MeshPart(mesh), mm.MeshPart(repaired)
+    distance = 0.0 if report.get("geometry_unchanged") else math.sqrt(mm.findMaxDistanceSq(original_part, result_part))
+    if not math.isfinite(distance):
+        raise RuntimeError("Не удалось получить конечную оценку отклонения.")
+    report["vertex_surface_deviation_mm"] = distance
+    report["sampled_tolerance_pass"] = distance <= settings.tolerance_mm
+    report["status"] = "candidate_within_sampled_tolerance" if report["sampled_tolerance_pass"] else "candidate_exceeds_tolerance"
+    if not report["sampled_tolerance_pass"]:
+        report["warnings"].append("Оценка отклонения превышает допуск. Файл — только кандидат для проверки.")
+    repaired.transform(mm.AffineXf3f.translation(center))
+    # Write same-directory temporary first; exclusive target creation prevents overwrite races.
+    fd, tmp = tempfile.mkstemp(prefix=".meshrepair-", suffix=".stl", dir=target.parent)
+    os.close(fd)
+    published = False
+    try:
+        mm.saveMesh(repaired, tmp)
+        # Atomic, no-overwrite publication on NTFS and POSIX. Fail safely on
+        # filesystems without hard links (e.g. FAT32): use a local NTFS folder.
+        os.link(tmp, target)
+        published = True
+        report["output"] = str(target)
+        report["elapsed_seconds"] = time.monotonic() - started
+        atomic_json(str(target) + ".json", report)
+    except BaseException:
+        if published:
+            target.unlink(missing_ok=True)
+        raise
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+    emit("Кандидат сохранён. Откройте отчёт и проверьте геометрию.")
+    return report
+
+
+def voxel_repair(mesh, mm, settings, estimate, step, report, emit):
     if estimate["cells"] > settings.max_grid_cells:
         raise ValueError(f"Оценка сетки: {estimate['cells']:,} ячеек; лимит {settings.max_grid_cells:,}. "
                          "Полное перестроение при таком допуске слишком дорого. "
@@ -136,50 +203,62 @@ def run(source, destination=None, settings=Settings(), emit=lambda message: None
         mesh.topology.flipOrientation()
         report["warnings"].append("Развёрнута замкнутая оболочка с отрицательным объёмом.")
     emit(f"Перестроение: {report['compute_device']}; шаг {step:g} мм…")
-    repaired = mm.generalOffsetMesh(mm.MeshPart(mesh), 0.0, params)
-    if repaired.topology.numValidFaces() == 0:
-        raise RuntimeError("Получена пустая поверхность; результат не сохранён.")
-    emit("Проверка результата…")
-    report["after"] = diagnostics(repaired, mm)
-    after = report["after"]
-    if after["components"] == 1 and after["closed"] and after["signed_volume_mm3"] < 0:
-        repaired.topology.flipOrientation()
-        after["signed_volume_mm3"] = repaired.volume()
-    valid = after["closed"] and after["topology_valid"] and after["self_intersecting_faces"] == 0
-    if settings.require_single_component:
-        valid = valid and after["components"] == 1
-    if not valid:
-        raise RuntimeError("Результат не прошёл проверку замкнутости/пересечений/связности; не сохранён. "
-                           + json.dumps(after, ensure_ascii=False))
-    emit("Оценка отклонений по вершинам в обе стороны…")
-    original_part, result_part = mm.MeshPart(mesh), mm.MeshPart(repaired)
-    distance = math.sqrt(mm.findMaxDistanceSq(original_part, result_part))
-    if not math.isfinite(distance):
-        raise RuntimeError("Не удалось получить конечную оценку отклонения.")
-    report["vertex_surface_deviation_mm"] = distance
-    report["sampled_tolerance_pass"] = distance <= settings.tolerance_mm
-    report["status"] = "candidate_within_sampled_tolerance" if report["sampled_tolerance_pass"] else "candidate_exceeds_tolerance"
-    if not report["sampled_tolerance_pass"]:
-        report["warnings"].append("Оценка отклонения превышает допуск. Файл — только кандидат для проверки.")
-    repaired.transform(mm.AffineXf3f.translation(center))
-    # Write same-directory temporary first; exclusive target creation prevents overwrite races.
-    fd, tmp = tempfile.mkstemp(prefix=".meshrepair-", suffix=".stl", dir=target.parent)
-    os.close(fd)
-    published = False
-    try:
-        mm.saveMesh(repaired, tmp)
-        # Atomic, no-overwrite publication on NTFS and POSIX. Fail safely on
-        # filesystems without hard links (e.g. FAT32): use a local NTFS folder.
-        os.link(tmp, target)
-        published = True
-        report["output"] = str(target)
-        report["elapsed_seconds"] = time.monotonic() - started
-        atomic_json(str(target) + ".json", report)
-    except BaseException:
-        if published:
-            target.unlink(missing_ok=True)
-        raise
-    finally:
-        Path(tmp).unlink(missing_ok=True)
-    emit("Кандидат сохранён. Откройте отчёт и проверьте геометрию.")
-    return report
+    return mm.generalOffsetMesh(mm.MeshPart(mesh), 0.0, params)
+
+
+def surface_repair(mesh, mm, settings, report, emit):
+    """Triangle-space operations. Never falls back to a volumetric remesh."""
+    report["compute_device"] = "cpu_native_parallel"
+    report["method"] = settings.method
+    if settings.device == "cuda":
+        emit("Этот метод выполняется на CPU. CUDA используется только в воксельном методе.")
+    before = report["before"]
+    if before["components"] > 256:
+        raise ValueError("Больше 256 оболочек: сначала требуется отдельная обработка фрагментов.")
+    if before["closed"] and before["self_intersecting_faces"] == 0 and settings.method == "surface":
+        emit("Сетка замкнута, пересечений нет: перестроение не требуется.")
+        report["geometry_unchanged"] = True
+        return mm.Mesh(mesh)
+    repaired = mm.Mesh(mesh)
+    holes = list(repaired.topology.findHoleRepresentiveEdges())
+    for edge in holes:
+        perimeter = mm.holePerimeter(repaired.topology, repaired.points, edge)
+        if perimeter > settings.max_hole_perimeter_mm:
+            raise ValueError(f"Периметр дыры {perimeter:.6g} мм превышает разрешённые "
+                             f"{settings.max_hole_perimeter_mm:g} мм. Измените отдельную настройку дыр.")
+    for edge in holes:
+        mm.fillHole(repaired, edge)
+    if holes:
+        emit(f"Закрыто дыр: {len(holes)}. Исходные поверхности не ремешились.")
+        report["filled_holes"] = len(holes)
+    if settings.method == "surface":
+        if before["self_intersecting_faces"]:
+            emit("Разрезание самопересечений по треугольникам (экспериментальный алгоритм)…")
+            repaired = mm.selfBoolean(repaired)
+            report["warnings"].append("Использован экспериментальный selfBoolean; требуется проверка формы.")
+        return repaired
+    emit("Объединение оболочек как сплошных тел: внутренние полости будут удалены.")
+    report["warnings"].append("Объединение сплошных тел удаляет вложенные оболочки и внутренние полости.")
+    regions = mm.MeshComponents.getAllComponents(mm.MeshPart(repaired))
+    result = None
+    for index, region in enumerate(regions):
+        part = repaired.cloneRegion(region)
+        if not part.topology.isClosed():
+            raise RuntimeError("Не удалось замкнуть оболочку перед объединением.")
+        if mm.findSelfCollidingTrianglesBS(mm.MeshPart(part)).count():
+            part = mm.selfBoolean(part)
+            if mm.findSelfCollidingTrianglesBS(mm.MeshPart(part)).count() or not part.topology.isClosed():
+                raise RuntimeError("Оболочка содержит неустранённые самопересечения; объединение остановлено.")
+        if part.volume() < 0:
+            part.topology.flipOrientation()
+        if result is None:
+            result = part
+        else:
+            emit(f"Булево объединение оболочки {index + 1}/{len(regions)}…")
+            operation = mm.boolean(result, part, mm.BooleanOperation.Union)
+            if not operation.valid():
+                raise RuntimeError("Ошибка объединения: " + operation.errorString)
+            result = operation.mesh
+    if result is None:
+        raise RuntimeError("Нет оболочек для объединения.")
+    return result
