@@ -53,7 +53,7 @@ def test_rebuild_and_report(tmp_path):
     assert report['vertex_surface_deviation_mm'] >= 0
     assert not report['tolerance_certified']
     assert source.read_bytes() == original
-    assert json.loads((tmp_path / 'result.stl.json').read_text())['output'] == str(target)
+    assert json.loads((tmp_path / 'result.stl.json').read_text(encoding='utf-8'))['output'] == str(target)
     reloaded = mm.loadMesh(target)
     assert reloaded.topology.isClosed()
 

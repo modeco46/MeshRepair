@@ -11,6 +11,11 @@ def send(kind, value):
 
 
 def main():
+    # Stable protocol even in frozen Windows builds with a legacy console locale.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="MeshRepair 0.1 — native mesh repair prototype")
     parser.add_argument("source")
     parser.add_argument("--output")
