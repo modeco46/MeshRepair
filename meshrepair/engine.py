@@ -102,8 +102,7 @@ def run(source, destination=None, settings=Settings(), emit=lambda message: None
               "grid_estimate": estimate, "tolerance_certified": False,
               "loader": {"skipped_faces": skipped.value, "duplicated_vertices": duplicated.value},
               "warnings": ["Расстояния проверяются по вершинам в обе стороны, а не по всей поверхности.",
-                           "Закрытие дыр и удаление внутренних оболочек изменяют геометрию.",
-                           "Размер вокселя не гарантирует заданный допуск."]}
+                           "Закрытие дыр и удаление внутренних оболочек изменяют геометрию."]}
     emit("Проверка исходной сетки и самопересечений…")
     report["before"] = diagnostics(mesh, mm)
     info = report["before"]
@@ -173,10 +172,15 @@ def run(source, destination=None, settings=Settings(), emit=lambda message: None
 
 
 def voxel_repair(mesh, mm, settings, estimate, step, report, emit):
+    report["warnings"].append("Размер вокселя не гарантирует заданный допуск.")
     if estimate["cells"] > settings.max_grid_cells:
         raise ValueError(f"Оценка сетки: {estimate['cells']:,} ячеек; лимит {settings.max_grid_cells:,}. "
                          "Полное перестроение при таком допуске слишком дорого. "
                          "Увеличьте допуск или используйте меньшую модель. Точность автоматически не снижается.")
+    # A closed, single, consistently inward shell otherwise has negative winding.
+    if report["before"]["closed"] and report["before"]["components"] == 1 and mesh.volume() < 0:
+        mesh.topology.flipOrientation()
+        report["warnings"].append("Развёрнута замкнутая оболочка с отрицательным объёмом.")
     params = mm.GeneralOffsetParameters()
     params.voxelSize = step
     params.signDetectionMode = mm.SignDetectionMode.HoleWindingRule
@@ -198,10 +202,6 @@ def voxel_repair(mesh, mm, settings, estimate, step, report, emit):
             if settings.device == "cuda":
                 raise RuntimeError(f"Запрошена CUDA, но она недоступна: {exc}") from exc
             report["warnings"].append(f"Автоматический переход на CPU: {exc}")
-    # A closed, single, consistently inward shell otherwise has negative winding.
-    if report["before"]["closed"] and report["before"]["components"] == 1 and mesh.volume() < 0:
-        mesh.topology.flipOrientation()
-        report["warnings"].append("Развёрнута замкнутая оболочка с отрицательным объёмом.")
     emit(f"Перестроение: {report['compute_device']}; шаг {step:g} мм…")
     return mm.generalOffsetMesh(mm.MeshPart(mesh), 0.0, params)
 

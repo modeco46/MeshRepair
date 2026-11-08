@@ -149,8 +149,12 @@ def test_hole_size_limit_is_separate(tmp_path):
     assert report['after']['closed']
 
 
-def test_voxel_method_still_available(tmp_path):
-    report = run(save(tmp_path, cube()), tmp_path / 'voxel.stl', Settings(method='voxel', device='cpu'))
+@pytest.mark.parametrize('inverted', [False, True])
+def test_voxel_method_still_available(tmp_path, inverted):
+    mesh = cube()
+    if inverted:
+        mesh.topology.flipOrientation()
+    report = run(save(tmp_path, mesh), tmp_path / 'voxel.stl', Settings(method='voxel', device='cpu'))
     assert report['after']['closed']
     assert report['after']['triangles'] > 12
 
