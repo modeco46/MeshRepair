@@ -5,6 +5,7 @@ triangle (both directions), rather than merely checking distances at mesh vertic
 """
 import math
 import os
+from functools import lru_cache
 import numpy as np
 
 
@@ -63,6 +64,11 @@ def triangle_upper_bounds(triangles, targets):
     distance <= max_i ||p_i-q_i|| from that target triangle (and thus target mesh).
     No assumption that a triangle's interior follows its vertices' nearest faces.
     """
+    return np.max(triangle_vertex_distances(triangles, targets), axis=1)
+
+
+def triangle_vertex_distances(triangles, targets):
+    """Distances from source vertices to explicitly constructed target points."""
     a, b, c = targets[:, 0, :], targets[:, 1, :], targets[:, 2, :]
     ab, ac = b - a, c - a
     delta = triangles - a[:, None, :]
@@ -89,7 +95,40 @@ def triangle_upper_bounds(triangles, targets):
         t = np.clip(t, 0, 1)
         on_edge = first[:, None, :] + t[:, :, None] * edge[:, None, :]
         best = np.minimum(best, np.sum((triangles - on_edge) ** 2, axis=2))
-    return np.sqrt(np.max(best, axis=1))
+    return np.sqrt(best)
+
+
+def quad_upper_bounds(triangles, quads):
+    """Bound to two adjacent triangles ABC/ABD, including any fold height.
+
+    Project D onto ABC's plane. If ABC union ABD_projected is convex, convex
+    combinations of three chosen target points stay in that union. Lifting any
+    such point back onto ABC or ABD adds at most |D-D_projected| to the distance.
+    This avoids subdividing to the tolerance along artificial triangulation edges.
+    A concave/degenerate projection supplies no bound and returns infinity.
+    """
+    a, b, c, d = (quads[:, i] for i in range(4))
+    normal = np.cross(b - a, c - a)
+    area_sq = np.sum(normal * normal, axis=1)
+    safe_area = np.maximum(area_sq, np.finfo(float).tiny)
+    dot = np.sum((d - a) * normal, axis=1)
+    projected = d - (dot / safe_area)[:, None] * normal
+    height = np.abs(dot) / np.sqrt(safe_area)
+    side_d = np.sum(np.cross(b - a, projected - a) * normal, axis=1)
+    side_a = np.sum(np.cross(projected - c, a - c) * normal, axis=1)
+    side_b = np.sum(np.cross(projected - c, b - c) * normal, axis=1)
+    eps = 1e-12 * area_sq
+    crossing = (((side_a < -eps) & (side_b > eps)) | ((side_b < -eps) & (side_a > eps))
+                | ((side_a == 0) & (np.abs(side_b) > eps))
+                | ((side_b == 0) & (np.abs(side_a) > eps)))
+    convex = (area_sq > 0) & (side_d < -eps) & crossing
+    result = np.full(len(triangles), np.inf)
+    if convex.any():
+        first = triangle_vertex_distances(triangles[convex], quads[convex, :3])
+        second = triangle_vertex_distances(triangles[convex],
+            np.stack([a[convex], b[convex], projected[convex]], axis=1))
+        result[convex] = np.max(np.minimum(first, second), axis=1) + height[convex]
+    return result
 
 
 def verify_surface_bound(reference, candidate, tolerance, progress=lambda value: None,
@@ -126,6 +165,19 @@ def verify_surface_bound(reference, candidate, tolerance, progress=lambda value:
         target_faces, target_verts = faces[1 - direction], vertices[1 - direction]
         projector = mm.PointsToMeshProjector()
         projector.updateMeshData(meshes[1 - direction])
+        topology = meshes[1 - direction].topology
+
+        @lru_cache(maxsize=8192)
+        def adjacent_quads(face):
+            quads = []
+            for edge in mm.leftRing(topology, mm.FaceId(face)):
+                u, v = int(topology.org(edge)), int(topology.dest(edge))
+                c = next(int(x) for x in target_faces[face] if x != u and x != v)
+                right = int(topology.right(edge))
+                d = next((int(x) for x in target_faces[right] if x != u and x != v), c) if right >= 0 else c
+                quads.append(target_verts[[u, v, c, d]])
+            return np.array(quads)
+
         for start in range(0, len(source_faces), 2048):
             initial = source_verts[source_faces[start:start + 2048]]
             stack = [(initial, 0)]
@@ -147,6 +199,12 @@ def verify_surface_bound(reference, candidate, tolerance, progress=lambda value:
                 if (distances > tolerance * tolerance).any():
                     return {'verified': False, 'reason': 'sample_exceeds_tolerance', 'checked_subtriangles': checked}
                 bounds = triangle_upper_bounds(tris, target_verts[target_faces[ids]])
+                unresolved = np.flatnonzero(bounds > limit)
+                if len(unresolved):
+                    patches = np.array([adjacent_quads(int(face)) for face in ids[unresolved]])
+                    for edge in range(3):
+                        bounds[unresolved] = np.minimum(bounds[unresolved],
+                            quad_upper_bounds(tris[unresolved], patches[:, edge]))
                 good = np.isfinite(bounds) & (bounds <= limit)
                 if good.any():
                     maximum = max(maximum, float(bounds[good].max()) + margin)
@@ -159,17 +217,19 @@ def verify_surface_bound(reference, candidate, tolerance, progress=lambda value:
                                         np.sum((bad[:, 1] - bad[:, 2]) ** 2, axis=1),
                                         np.sum((bad[:, 2] - bad[:, 0]) ** 2, axis=1)], axis=1)
                     which = np.argmax(lengths, axis=1)
-                    for edge, (i, j, k) in enumerate(((0, 1, 2), (1, 2, 0), (2, 0, 1))):
-                        subset = bad[which == edge]
-                        if not len(subset):
-                            continue
-                        middle = (subset[:, i] + subset[:, j]) * .5
-                        stack.append((np.stack([subset[:, i], middle, subset[:, k]], axis=1), depth + 1))
-                        stack.append((np.stack([middle, subset[:, j], subset[:, k]], axis=1), depth + 1))
+                    rows = np.arange(len(bad))
+                    a, b, c = bad[rows, which], bad[rows, (which + 1) % 3], bad[rows, (which + 2) % 3]
+                    middle = (a + b) * .5
+                    children = np.concatenate([np.stack([a, middle, c], axis=1),
+                                               np.stack([middle, b, c], axis=1)])
+                    # Keep useful batch sizes instead of recursively splitting
+                    # into six tiny groups by edge index; bound temporary memory.
+                    for offset in range(0, len(children), 2048):
+                        stack.append((children[offset:offset + 2048], depth + 1))
                 progress(completed / total_faces)
             completed += len(initial)
             progress(completed / total_faces)
     return {'verified': True, 'upper_bound_mm': maximum, 'tolerance_mm': tolerance,
             'checked_subtriangles': checked, 'numeric_margin_mm': margin,
             'reference': 'repaired_mesh_before_simplification',
-            'method': 'bidirectional_adaptive_triangle_convex_bounds'}
+            'method': 'bidirectional_adaptive_convex_patch_bounds'}

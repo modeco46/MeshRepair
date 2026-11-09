@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 from meshlib import mrmeshpy as mm, mrmeshnumpy as mn
 from meshrepair.engine import Settings, Progress, run
-from meshrepair.reduction import propose_reduction, verify_surface_bound, triangle_upper_bounds
+from meshrepair.reduction import propose_reduction, verify_surface_bound, triangle_upper_bounds, quad_upper_bounds
 
 
 def dense_cube():
@@ -107,6 +107,28 @@ def test_triangle_bounds_parallel_plane():
     a = np.array([[[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]]])
     b = a + [0, 0, .1]
     assert triangle_upper_bounds(a, b)[0] == pytest.approx(.1)
+
+
+def test_convex_pair_bound_includes_fold_height():
+    source = np.array([[[0., 0., 0.], [1., 1., 0.], [1., 0., 0.]]])
+    quad = np.array([[[0., 0., 0.], [1., 1., 0.], [0., 1., 0.], [1., 0., .1]]])
+    assert quad_upper_bounds(source, quad)[0] == pytest.approx(.1)
+    quad[:, 3, 2] = 0
+    assert quad_upper_bounds(source, quad)[0] == pytest.approx(0)
+
+
+def test_concave_pair_cannot_certify_convex_hull():
+    source = np.array([[[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]]])
+    quad = np.array([[[0., 0., 0.], [.1, .1, 0.], [0., 1., 0.], [1., 0., 0.]]])
+    assert np.isinf(quad_upper_bounds(source, quad)[0])
+
+
+def test_planar_20mm_mesh_verified_at_micron_tolerance():
+    mesh = dense_cube()
+    mesh.transform(mm.AffineXf3f.linear(mm.Matrix3f.scale(20)))
+    result, _ = propose_reduction(mesh, mm, Settings(.001, True), Progress(lambda _: None))
+    assert result.topology.numValidFaces() < mesh.topology.numValidFaces() / 2
+    assert verify_surface_bound(mesh, result, .001, max_checks=100000)['verified']
 
 
 def test_exported_simplification_verified_against_repaired_surface(tmp_path):
