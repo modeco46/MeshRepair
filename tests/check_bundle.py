@@ -26,6 +26,28 @@ if __name__ == '__main__':
         assert report['after']['closed']
         assert report['after']['components'] == 1
 
+        # Exercise reduction, NumPy and the whole-surface verifier in the EXE.
+        dense = mm.makeCube()
+        subdivision = mm.SubdivideSettings()
+        subdivision.maxEdgeLen = .15
+        subdivision.maxAngleChangeAfterFlip = 0
+        mm.subdivideMesh(dense, subdivision)
+        mm.saveMesh(dense, source)
+        target = Path(folder) / 'simplified.stl'
+        p = subprocess.run([executable, '--worker', str(source), '--output', str(target),
+                            '--quality', '.02', '--collapse-coplanar', '--coplanar-angle', '1',
+                            '--simplify-curved'], capture_output=True, encoding='utf-8',
+                           errors='replace', timeout=180)
+        print(p.stdout)
+        print(p.stderr)
+        assert p.returncode == 0
+        report = json.loads(Path(str(target) + '.json').read_text(encoding='utf-8'))
+        assert report['simplification']['accepted']
+        assert report['simplification']['after'] < report['simplification']['before']
+        assert report['simplification']['verification']['upper_bound_mm'] <= .02
+        assert report['after']['closed']
+        assert report['after']['self_intersecting_faces'] == 0
+
         damaged = mm.Mesh()
         for i in range(40):
             part = mm.makeCube(mm.Vector3f(.1, .1, .1), mm.Vector3f(i * .2, 0, 0))

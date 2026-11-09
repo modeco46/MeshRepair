@@ -11,10 +11,15 @@ import time
 @dataclass(frozen=True)
 class Settings:
     quality_mm: float = 0.02
+    collapse_coplanar: bool = False
+    coplanar_angle_deg: float = 1.0
+    simplify_curved: bool = False
 
     def validate(self):
         if not math.isfinite(self.quality_mm) or not .001 <= self.quality_mm <= .5:
             raise ValueError("Качество должно быть от 0,001 до 0,5 мм.")
+        if not math.isfinite(self.coplanar_angle_deg) or not 0 <= self.coplanar_angle_deg <= 45:
+            raise ValueError("Угол копланарности должен быть от 0 до 45 градусов.")
 
 
 class Progress:
@@ -116,7 +121,7 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit):
     params = mm.OffsetParameters()
     params.voxelSize = settings.quality_mm
     params.signDetectionMode = mm.SignDetectionMode.HoleWindingRule
-    params.callBack = tracker.callback(42, 78, "Восстановление поверхности")
+    params.callBack = tracker.callback(42, 65, "Восстановление поверхности")
     report["compute_device"] = "cpu_native_parallel"
     # Winding sign depends on orientation. Closed operands were oriented earlier;
     # for fragmented input this is a global heuristic, not a guarantee of inside/outside.
@@ -162,7 +167,7 @@ def run(source, destination=None, settings=Settings(), emit=lambda message: None
     from meshlib import mrmeshpy as mm
     started = time.monotonic()
     tracker = Progress(progress)
-    report = {"version": "0.3.0", "settings": asdict(settings), "source": str(source),
+    report = {"version": "0.4.0", "settings": asdict(settings), "source": str(source),
               "units": "mm", "tolerance_certified": False, "warnings": [],
               "compute_device": "cpu_native_parallel"}
     load_settings = mm.MeshLoadSettings()
@@ -210,7 +215,7 @@ def run(source, destination=None, settings=Settings(), emit=lambda message: None
         repaired = sparse_repair(mesh, mm, settings, tracker, report, emit)
     if repaired is None or repaired.topology.numValidFaces() == 0:
         raise RuntimeError("Не удалось восстановить непустую поверхность при выбранном качестве. Файл не сохранён.")
-    after = diagnostics(repaired, mm, tracker.callback(78, 85, "Проверка восстановленной сетки"))
+    after = diagnostics(repaired, mm, tracker.callback(65, 70, "Проверка восстановленной сетки"))
     if not valid(after):
         raise RuntimeError("Восстановленная поверхность не прошла проверку. "
                            f"Дыр: {after['boundary_loops']}; пересечений: {after['self_intersecting_faces']}. "
@@ -223,7 +228,7 @@ def run(source, destination=None, settings=Settings(), emit=lambda message: None
         cleanup.mode = mm.FixMeshDegeneraciesParams.Mode.Decimate
         cleanup.maxDeviation = settings.quality_mm * .01
         cleanup.tinyEdgeLength = settings.quality_mm * .001
-        cleanup.cb = tracker.callback(85, 87, "Удаление вырожденных треугольников")
+        cleanup.cb = tracker.callback(70, 72, "Удаление вырожденных треугольников")
         mm.fixMeshDegeneracies(repaired, cleanup)
     # Original working copies are no longer needed during STL round-trip validation.
     mesh = None
@@ -233,16 +238,59 @@ def run(source, destination=None, settings=Settings(), emit=lambda message: None
     published = False
     try:
         save_settings = mm.SaveSettings()
-        save_settings.progress = tracker.callback(87, 90, "Запись результата")
+        save_settings.progress = tracker.callback(72, 74, "Запись результата")
         mm.saveMesh(repaired, tmp, save_settings)
         # Validate the actual exported STL, not just the in-memory mesh.
         del repaired
         check_settings = mm.MeshLoadSettings()
-        check_settings.callback = tracker.callback(90, 94, "Проверка сохранённого файла")
+        check_settings.callback = tracker.callback(74, 75, "Проверка сохранённого файла")
         exported = mm.loadMesh(tmp, check_settings)
-        report["after"] = diagnostics(exported, mm, tracker.callback(94, 99, "Контроль результата"))
+        report["after"] = diagnostics(exported, mm, tracker.callback(75, 78, "Контроль результата"))
         if not valid(report["after"]):
             raise RuntimeError("STL после сохранения не прошёл проверку: " + str(report["after"]))
+        if settings.collapse_coplanar or settings.simplify_curved:
+            from .reduction import propose_reduction, verify_surface_bound
+            original_info = report["after"]
+            reduction = {"requested": True, "accepted": False,
+                         "before": original_info["triangles"], "after": original_info["triangles"],
+                         "tolerance_mm": settings.quality_mm}
+            report["simplification"] = reduction
+            candidate_tmp = None
+            try:
+                proposal, stages = propose_reduction(exported, mm, settings, tracker)
+                reduction["stages"] = stages
+                if proposal.topology.numValidFaces() < original_info["triangles"]:
+                    fd2, candidate_tmp = tempfile.mkstemp(prefix=".meshrepair-simplified-", suffix=".stl", dir=target.parent)
+                    os.close(fd2)
+                    proposed_save = mm.SaveSettings()
+                    proposed_save.progress = tracker.callback(85, 86, "Запись упрощённой сетки")
+                    mm.saveMesh(proposal, candidate_tmp, proposed_save)
+                    del proposal
+                    candidate = mm.loadMesh(candidate_tmp)
+                    candidate_info = diagnostics(candidate, mm, tracker.callback(86, 88, "Проверка топологии после упрощения"))
+                    if valid(candidate_info) and candidate_info["components"] == original_info["components"]:
+                        reduction["verification"] = verify_surface_bound(exported, candidate, settings.quality_mm,
+                            tracker.callback(88, 99, "Проверка допуска упрощения в обе стороны"))
+                        if reduction["verification"]["verified"]:
+                            os.replace(candidate_tmp, tmp)
+                            candidate_tmp = None
+                            report["after"] = candidate_info
+                            reduction.update(accepted=True, after=candidate_info["triangles"])
+                    else:
+                        reduction["verification"] = {"verified": False, "reason": "topology_changed"}
+                    if not reduction["accepted"]:
+                        emit("Допуск или топология упрощения не подтверждены. Сохраняю исправленную сетку без упрощения.")
+                        report["warnings"].append("Упрощение отклонено; сохранён исправленный вариант до упрощения.")
+                else:
+                    reduction["reason"] = "no_reducible_edges"
+                    emit("Избыточных треугольников при выбранных ограничениях не найдено.")
+            except (RuntimeError, MemoryError) as exc:
+                reduction["reason"] = str(exc)
+                report["warnings"].append("Упрощение не завершилось; сохранён исправленный вариант без упрощения.")
+            finally:
+                if candidate_tmp:
+                    Path(candidate_tmp).unlink(missing_ok=True)
+            emit(f"Упрощение: {reduction['before']:,} → {reduction['after']:,} треугольников.")
         count = report["after"]["components"]
         if count > 1:
             report["warnings"].append(f"В файле {count} замкнутых оболочек. Раздельные детали сохранены; перемычки не добавлялись.")

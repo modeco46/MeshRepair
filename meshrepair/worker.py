@@ -14,14 +14,17 @@ def main():
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, 'reconfigure'):
             stream.reconfigure(encoding='utf-8', errors='replace')
-    parser = argparse.ArgumentParser(description='MeshRepair 0.3 — automatic repair')
+    parser = argparse.ArgumentParser(description='MeshRepair 0.4 — automatic repair')
     parser.add_argument('source')
     parser.add_argument('--output')
     parser.add_argument('--quality', type=float, default=.02)
+    parser.add_argument('--collapse-coplanar', action='store_true')
+    parser.add_argument('--coplanar-angle', type=float, default=1.0)
+    parser.add_argument('--simplify-curved', action='store_true')
     parser.add_argument('--debug', action='store_true')
     args = parser.parse_args()
     try:
-        result = run(args.source, args.output, Settings(args.quality),
+        result = run(args.source, args.output, Settings(args.quality, args.collapse_coplanar, args.coplanar_angle, args.simplify_curved),
                      lambda text: send('log', text), lambda event: send('progress', event))
         send('result', result)
         return 0

@@ -1,4 +1,4 @@
-"""One file, one quality setting, Repair and Stop. Native work is isolated."""
+"""One-click repair with optional reduction. Native work is isolated."""
 import json
 import os
 from pathlib import Path
@@ -15,14 +15,15 @@ from .engine import Settings
 class App:
     def __init__(self, root):
         self.root = root
-        root.title('MeshRepair 0.3')
-        root.geometry('850x560')
-        root.minsize(680, 440)
+        root.title('MeshRepair 0.4')
+        root.geometry('880x670')
+        root.minsize(760, 560)
         self.process = None
         self.events = queue.Queue()
         self.finished = False
         self.stopping = False
         self.started = 0
+        self.is_busy = False
         panel = ttk.Frame(root, padding=18)
         panel.pack(fill='both', expand=True)
         ttk.Label(panel, text='Исходная сетка').pack(anchor='w')
@@ -35,12 +36,32 @@ class App:
         self.browse.pack(side='left', padx=(8, 0))
         row = ttk.Frame(panel)
         row.pack(fill='x', pady=5)
-        ttk.Label(row, text='Качество, мм:').pack(side='left')
+        ttk.Label(row, text='Качество / допуск, мм:').pack(side='left')
         self.quality = tk.StringVar(value='0.02')
         self.quality_entry = ttk.Combobox(row, textvariable=self.quality, width=10,
             values=['0.001', '0.005', '0.01', '0.02', '0.05', '0.1', '0.2', '0.5'])
         self.quality_entry.pack(side='left', padx=8)
         ttk.Label(row, text='Меньше — подробнее, больше — быстрее.').pack(side='left', padx=8)
+        options = ttk.LabelFrame(panel, text='Уменьшение числа треугольников', padding=9)
+        options.pack(fill='x', pady=8)
+        self.planar = tk.BooleanVar(value=False)
+        self.curved = tk.BooleanVar(value=False)
+        self.angle = tk.StringVar(value='1.0')
+        row = ttk.Frame(options)
+        row.pack(fill='x')
+        self.planar_check = ttk.Checkbutton(row, text='Схлопывать копланарные полигоны',
+            variable=self.planar, command=self.update_angle_state)
+        self.planar_check.pack(side='left')
+        ttk.Label(row, text='Угол, °:').pack(side='left', padx=(15, 4))
+        self.angle_entry = ttk.Combobox(row, textvariable=self.angle, width=7, state='disabled',
+            values=['0', '0.1', '0.5', '1', '2', '5', '10', '30', '45'])
+        self.angle_entry.pack(side='left')
+        self.curved_check = ttk.Checkbutton(options,
+            text='Упрощать криволинейные участки в пределах допуска', variable=self.curved)
+        self.curved_check.pack(anchor='w', pady=(5, 0))
+        ttk.Label(options, wraplength=790, text=(
+            'Допуск берётся из поля «Качество / допуск» и отсчитывается от исправленной сетки. '
+            'Если проверка не подтвердит допуск, упрощение будет отменено.')).pack(anchor='w', pady=(5, 0))
         ttk.Label(panel, wraplength=780, text=(
             'Единицы: миллиметры. Результат сохраняется рядом с исходником в новый STL. '
             'Исходный файл не изменяется.')).pack(anchor='w', pady=(7, 10))
@@ -72,23 +93,33 @@ class App:
         if path:
             self.source.set(path)
 
+    def update_angle_state(self):
+        self.angle_entry.configure(state='normal' if self.planar.get() and not self.is_busy else 'disabled')
+
     def busy(self, value):
+        self.is_busy = value
         state = 'disabled' if value else 'normal'
-        for widget in (self.source_entry, self.browse, self.quality_entry, self.repair):
+        for widget in (self.source_entry, self.browse, self.quality_entry, self.repair, self.planar_check, self.curved_check):
             widget.configure(state=state)
         self.stop_button.configure(state='normal' if value else 'disabled')
+        self.update_angle_state()
 
     def start(self):
         if self.process:
             return
         try:
             value = float(self.quality.get().replace(',', '.'))
-            Settings(value).validate()
+            angle = float(self.angle.get().replace(',', '.')) if self.planar.get() else 1.0
+            Settings(value, self.planar.get(), angle, self.curved.get()).validate()
             if not Path(self.source.get()).is_file():
                 raise ValueError('Выберите исходную сетку.')
             command = ([sys.executable, '--worker'] if getattr(sys, 'frozen', False)
                        else [sys.executable, '-u', '-m', 'meshrepair.worker'])
             command += [self.source.get(), '--quality', str(value)]
+            if self.planar.get():
+                command += ['--collapse-coplanar', '--coplanar-angle', str(angle)]
+            if self.curved.get():
+                command += ['--simplify-curved']
             self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding='utf-8', errors='replace', env=dict(os.environ, PYTHONIOENCODING='utf-8'),
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
