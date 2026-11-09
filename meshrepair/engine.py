@@ -6,6 +6,7 @@ import math
 import os
 import tempfile
 import time
+from .compute import capabilities, cuda_module
 
 
 @dataclass(frozen=True)
@@ -130,8 +131,8 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit):
         mesh.topology.flipOrientation()
         report["warnings"].append("Общая ориентация исходной поверхности развёрнута по знаку объёма.")
     try:
-        from meshlib import mrcudapy as cuda
-        if cuda.isCudaAvailable():
+        cuda = cuda_module()
+        if cuda is not None:
             params.fwn = cuda.FastWindingNumber(mesh)
             report["compute_device"] = "cuda_winding_with_cpu_openvdb"
     except Exception as exc:
@@ -167,9 +168,9 @@ def run(source, destination=None, settings=Settings(), emit=lambda message: None
     from meshlib import mrmeshpy as mm
     started = time.monotonic()
     tracker = Progress(progress)
-    report = {"version": "0.4.0", "settings": asdict(settings), "source": str(source),
+    report = {"version": "0.5.0", "settings": asdict(settings), "source": str(source),
               "units": "mm", "tolerance_certified": False, "warnings": [],
-              "compute_device": "cpu_native_parallel"}
+              "compute_device": "cpu_native_parallel", "acceleration": capabilities()}
     load_settings = mm.MeshLoadSettings()
     skipped, duplicated = mm.int_output(), mm.int_output()
     load_settings.skippedFaceCount = skipped
@@ -270,7 +271,8 @@ def run(source, destination=None, settings=Settings(), emit=lambda message: None
                     candidate_info = diagnostics(candidate, mm, tracker.callback(86, 88, "Проверка топологии после упрощения"))
                     if valid(candidate_info) and candidate_info["components"] == original_info["components"]:
                         reduction["verification"] = verify_surface_bound(exported, candidate, settings.quality_mm,
-                            tracker.callback(88, 99, "Проверка допуска упрощения в обе стороны"))
+                            tracker.callback(88, 99, "Проверка допуска упрощения в обе стороны"),
+                            acceleration=report['acceleration'], emit=emit)
                         if reduction["verification"]["verified"]:
                             os.replace(candidate_tmp, tmp)
                             candidate_tmp = None

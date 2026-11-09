@@ -7,6 +7,7 @@ import math
 import os
 from functools import lru_cache
 import numpy as np
+from .compute import Projector, cpu_count
 
 
 def propose_reduction(mesh, mm, settings, progress):
@@ -36,7 +37,7 @@ def propose_reduction(mesh, mm, settings, progress):
         params.bdVerts = mm.getIncidentVerts(candidate.topology, creases) | candidate.topology.findBdVerts()
         if kind == 'coplanar':
             params.edgesToCollapse = candidate.topology.findNotLoneUndirectedEdges() - creases
-        params.subdivideParts = min(8, os.cpu_count() or 1) if before >= 50_000 else 1
+        params.subdivideParts = min(os.cpu_count() or 1, cpu_count(), max(1, before // 25_000))
         start, end = 78 + 7 * index / len(requested), 78 + 7 * (index + 1) / len(requested)
         stage = 'Схлопывание плоских участков' if kind == 'coplanar' else 'Упрощение криволинейных участков'
         progress.update(start, stage)
@@ -132,7 +133,7 @@ def quad_upper_bounds(triangles, quads):
 
 
 def verify_surface_bound(reference, candidate, tolerance, progress=lambda value: None,
-                         max_depth=32, max_checks=None):
+                         max_depth=32, max_checks=None, acceleration=None, emit=lambda message: None):
     """Conservative adaptive bidirectional bound; uncertainty REJECTS simplification.
 
     Native parallel projection chooses useful reference triangles; bound arithmetic
@@ -163,8 +164,8 @@ def verify_surface_bound(reference, candidate, tolerance, progress=lambda value:
     for direction in range(2):
         source_faces, source_verts = faces[direction], vertices[direction]
         target_faces, target_verts = faces[1 - direction], vertices[1 - direction]
-        projector = mm.PointsToMeshProjector()
-        projector.updateMeshData(meshes[1 - direction])
+        projector = Projector(meshes[1 - direction], mm, acceleration, emit)
+        batch_size = 32768 if projector.gpu else 2048
         topology = meshes[1 - direction].topology
 
         @lru_cache(maxsize=8192)
@@ -178,8 +179,8 @@ def verify_surface_bound(reference, candidate, tolerance, progress=lambda value:
                 quads.append(target_verts[[u, v, c, d]])
             return np.array(quads)
 
-        for start in range(0, len(source_faces), 2048):
-            initial = source_verts[source_faces[start:start + 2048]]
+        for start in range(0, len(source_faces), batch_size):
+            initial = source_verts[source_faces[start:start + batch_size]]
             stack = [(initial, 0)]
             while stack:
                 tris, depth = stack.pop()
@@ -224,8 +225,8 @@ def verify_surface_bound(reference, candidate, tolerance, progress=lambda value:
                                                np.stack([middle, b, c], axis=1)])
                     # Keep useful batch sizes instead of recursively splitting
                     # into six tiny groups by edge index; bound temporary memory.
-                    for offset in range(0, len(children), 2048):
-                        stack.append((children[offset:offset + 2048], depth + 1))
+                    for offset in range(0, len(children), batch_size):
+                        stack.append((children[offset:offset + batch_size], depth + 1))
                 progress(completed / total_faces)
             completed += len(initial)
             progress(completed / total_faces)

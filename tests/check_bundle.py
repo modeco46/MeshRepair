@@ -26,6 +26,19 @@ if __name__ == '__main__':
         assert report['after']['closed']
         assert report['after']['components'] == 1
 
+        checked = subprocess.run([executable, '--worker', str(source), '--check'],
+                                 capture_output=True, encoding='utf-8', errors='replace', timeout=60)
+        assert checked.returncode == 0, checked.stdout + checked.stderr
+        events = [json.loads(line) for line in checked.stdout.splitlines() if line.startswith('{')]
+        assert events[-1]['value']['info']['closed_components'] == 1
+        preview = Path(folder) / 'view.npz'
+        viewed = subprocess.run([executable, '--worker', str(source), '--preview-output', str(preview)],
+                                capture_output=True, encoding='utf-8', errors='replace', timeout=60)
+        assert viewed.returncode == 0, viewed.stdout + viewed.stderr
+        assert preview.is_file()
+        loaded = subprocess.run([executable, '--smoke-preview', str(preview)], capture_output=True, timeout=60)
+        assert loaded.returncode == 0, loaded.stderr
+
         # Exercise reduction, NumPy and the whole-surface verifier in the EXE.
         dense = mm.makeCube()
         subdivision = mm.SubdivideSettings()

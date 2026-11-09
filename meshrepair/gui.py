@@ -1,211 +1,387 @@
-"""One-click repair with optional reduction. Native work is isolated."""
+"""Qt application controller; MeshLib operations stay in a killable process."""
 import json
 import os
 from pathlib import Path
-import queue
-import subprocess
 import sys
-import threading
+import tempfile
 import time
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from PySide6.QtCore import QTimer, QProcess, QProcessEnvironment, QSettings
+from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtWidgets import QApplication, QMainWindow, QFileDialog
 from .engine import Settings
+from .theme import STYLE
+from .viewer import PreviewLoader
+from .widgets import LayoutMixin
 
 
-class App:
-    def __init__(self, root):
-        self.root = root
-        root.title('MeshRepair 0.4')
-        root.geometry('880x670')
-        root.minsize(760, 560)
-        self.process = None
-        self.events = queue.Queue()
-        self.finished = False
-        self.stopping = False
-        self.started = 0
-        self.is_busy = False
-        panel = ttk.Frame(root, padding=18)
-        panel.pack(fill='both', expand=True)
-        ttk.Label(panel, text='Исходная сетка').pack(anchor='w')
-        row = ttk.Frame(panel)
-        row.pack(fill='x', pady=(5, 14))
-        self.source = tk.StringVar()
-        self.source_entry = ttk.Entry(row, textvariable=self.source)
-        self.source_entry.pack(side='left', fill='x', expand=True)
-        self.browse = ttk.Button(row, text='Выбрать файл…', command=self.pick_source)
-        self.browse.pack(side='left', padx=(8, 0))
-        row = ttk.Frame(panel)
-        row.pack(fill='x', pady=5)
-        ttk.Label(row, text='Качество / допуск, мм:').pack(side='left')
-        self.quality = tk.StringVar(value='0.02')
-        self.quality_entry = ttk.Combobox(row, textvariable=self.quality, width=10,
-            values=['0.001', '0.005', '0.01', '0.02', '0.05', '0.1', '0.2', '0.5'])
-        self.quality_entry.pack(side='left', padx=8)
-        ttk.Label(row, text='Меньше — подробнее, больше — быстрее.').pack(side='left', padx=8)
-        options = ttk.LabelFrame(panel, text='Уменьшение числа треугольников', padding=9)
-        options.pack(fill='x', pady=8)
-        self.planar = tk.BooleanVar(value=False)
-        self.curved = tk.BooleanVar(value=False)
-        self.angle = tk.StringVar(value='1.0')
-        row = ttk.Frame(options)
-        row.pack(fill='x')
-        self.planar_check = ttk.Checkbutton(row, text='Схлопывать копланарные полигоны',
-            variable=self.planar, command=self.update_angle_state)
-        self.planar_check.pack(side='left')
-        ttk.Label(row, text='Угол, °:').pack(side='left', padx=(15, 4))
-        self.angle_entry = ttk.Combobox(row, textvariable=self.angle, width=7, state='disabled',
-            values=['0', '0.1', '0.5', '1', '2', '5', '10', '30', '45'])
-        self.angle_entry.pack(side='left')
-        self.curved_check = ttk.Checkbutton(options,
-            text='Упрощать криволинейные участки в пределах допуска', variable=self.curved)
-        self.curved_check.pack(anchor='w', pady=(5, 0))
-        ttk.Label(options, wraplength=790, text=(
-            'Допуск берётся из поля «Качество / допуск» и отсчитывается от исправленной сетки. '
-            'Если проверка не подтвердит допуск, упрощение будет отменено.')).pack(anchor='w', pady=(5, 0))
-        ttk.Label(panel, wraplength=780, text=(
-            'Единицы: миллиметры. Результат сохраняется рядом с исходником в новый STL. '
-            'Исходный файл не изменяется.')).pack(anchor='w', pady=(7, 10))
-        row = ttk.Frame(panel)
-        row.pack(fill='x', pady=8)
-        self.repair = ttk.Button(row, text='Исправить', command=self.start)
-        self.repair.pack(side='left')
-        self.stop_button = ttk.Button(row, text='Остановить', command=self.cancel, state='disabled')
-        self.stop_button.pack(side='left', padx=8)
-        self.elapsed = tk.StringVar(value='')
-        ttk.Label(row, textvariable=self.elapsed).pack(side='right')
-        self.status = tk.StringVar(value='Выберите файл и нажмите «Исправить».')
-        ttk.Label(panel, textvariable=self.status, wraplength=780).pack(anchor='w', pady=(6, 4))
-        self.progress = ttk.Progressbar(panel, mode='determinate', maximum=100)
-        self.progress.pack(fill='x', pady=(0, 12))
-        self.log = tk.Text(panel, height=16, wrap='word', state='disabled')
-        self.log.pack(fill='both', expand=True)
-        root.protocol('WM_DELETE_WINDOW', self.close)
-        self.poll_id = root.after(100, self.poll)
+class App(QMainWindow, LayoutMixin):
+    def __init__(self, *, preview_enabled=True, persist=True):
+        super().__init__()
+        self.setWindowTitle('MeshRepair 0.5')
+        self.setMinimumSize(980, 680)
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.resize(min(1280, screen.width() - 60), min(880, screen.height() - 70))
+        self.setAcceptDrops(True)
+        self.setStyleSheet(STYLE)
+        self.preferences = QSettings('MeshRepair', 'MeshRepair') if persist else None
+        self.source_path = self.view_path = self.result_path = None
+        self.process = self.loader = None
+        self.is_busy = self.stopping = self.closing = False
+        self.operation = None
+        self.reports = {}
+        self.last_repair_report = self.last_check_report = None
+        self.temp = tempfile.TemporaryDirectory(prefix='meshrepair-preview-')
+        self.raw_output = b''
+        self.job_result = None
+        self.job_error = False
+        self.setup_ui(preview_enabled and os.environ.get('MESHREPAIR_NO_3D') != '1')
+        self.clock = QTimer(self)
+        self.clock.setInterval(250)
+        self.clock.timeout.connect(self.update_clock)
+        QShortcut(QKeySequence.Open, self, activated=self.pick_source)
+        if self.preferences:
+            self.quality.setValue(float(self.preferences.value('quality', .02)))
+            self.angle.setValue(float(self.preferences.value('angle', 1)))
+            self.planar.setChecked(self.preferences.value('planar', False, type=bool))
+            self.curved.setChecked(self.preferences.value('curved', False, type=bool))
+        self.set_busy(False)
 
     def write(self, text):
-        self.log.configure(state='normal')
-        self.log.insert('end', text + '\n')
-        self.log.see('end')
-        self.log.configure(state='disabled')
+        self.log.appendPlainText(str(text))
+
+    def clear_logs(self):
+        self.log.clear()
+
+    def copy_logs(self):
+        text = self.log.textCursor().selectedText().replace('\u2029', '\n')
+        QApplication.clipboard().setText(text or self.log.toPlainText())
+
+    def show_renderer(self, name):
+        self.render_label.setToolTip('Устройство отображения OpenGL: ' + name)
+        self.write('3D-отображение: ' + name)
+
+    def update_view(self):
+        self.view.set_mode(self.surface_button.isChecked(), self.edge_button.isChecked())
+
+    @staticmethod
+    def drop_path(mime):
+        if mime.hasUrls():
+            for url in mime.urls():
+                if url.isLocalFile():
+                    path = Path(url.toLocalFile())
+                    if path.is_file() and path.suffix.lower() in {'.stl', '.obj', '.ply'}:
+                        return path
+        return None
+
+    def dragEnterEvent(self, event):
+        if not self.is_busy and self.drop_path(event.mimeData()):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        path = self.drop_path(event.mimeData())
+        if path and not self.is_busy:
+            self.set_source(path)
+            event.acceptProposedAction()
 
     def pick_source(self):
-        path = filedialog.askopenfilename(filetypes=[('Сетка', '*.stl *.obj *.ply')])
-        if path:
-            self.source.set(path)
-
-    def update_angle_state(self):
-        self.angle_entry.configure(state='normal' if self.planar.get() and not self.is_busy else 'disabled')
-
-    def busy(self, value):
-        self.is_busy = value
-        state = 'disabled' if value else 'normal'
-        for widget in (self.source_entry, self.browse, self.quality_entry, self.repair, self.planar_check, self.curved_check):
-            widget.configure(state=state)
-        self.stop_button.configure(state='normal' if value else 'disabled')
-        self.update_angle_state()
-
-    def start(self):
-        if self.process:
+        if self.is_busy:
             return
-        try:
-            value = float(self.quality.get().replace(',', '.'))
-            angle = float(self.angle.get().replace(',', '.')) if self.planar.get() else 1.0
-            Settings(value, self.planar.get(), angle, self.curved.get()).validate()
-            if not Path(self.source.get()).is_file():
-                raise ValueError('Выберите исходную сетку.')
-            command = ([sys.executable, '--worker'] if getattr(sys, 'frozen', False)
-                       else [sys.executable, '-u', '-m', 'meshrepair.worker'])
-            command += [self.source.get(), '--quality', str(value)]
-            if self.planar.get():
-                command += ['--collapse-coplanar', '--coplanar-angle', str(angle)]
-            if self.curved.get():
+        filename, _ = QFileDialog.getOpenFileName(self, 'Открыть сетку', '', 'Сетки (*.stl *.obj *.ply)')
+        if filename:
+            self.set_source(filename)
+
+    def set_source(self, path):
+        if self.is_busy:
+            return
+        path = Path(path).resolve()
+        if not path.is_file() or path.suffix.lower() not in {'.stl', '.obj', '.ply'}:
+            self.write('Поддерживаются существующие STL, OBJ и PLY.')
+            return
+        self.source_path = self.view_path = path
+        self.result_path = None
+        self.reports.clear()
+        self.filename.setText(path.name)
+        self.filename.setToolTip(str(path))
+        self.view.clear()
+        self.update_info({})
+        self.source_button.setChecked(True)
+        self.result_button.setChecked(False)
+        self.write('\nОткрыт файл: ' + str(path))
+        self.start('preview')
+
+    def show_source(self, result):
+        if self.is_busy:
+            return
+        path = self.result_path if result else self.source_path
+        if path is None:
+            return
+        self.source_button.setChecked(not result)
+        self.result_button.setChecked(result)
+        if self.view_path == path and self.view.data is not None:
+            return
+        self.view.clear()
+        self.view_path = path
+        self.update_info(self.reports.get(str(path), {}))
+        self.start('preview')
+
+    def set_busy(self, busy):
+        self.is_busy = busy
+        for w in (self.browse, self.quality, self.planar, self.curved):
+            w.setEnabled(not busy)
+        self.angle.setEnabled(not busy and self.planar.isChecked())
+        self.repair.setEnabled(not busy and self.source_path is not None)
+        self.check_button.setEnabled(not busy and self.view_path is not None)
+        self.source_button.setEnabled(not busy and self.source_path is not None)
+        self.result_button.setEnabled(not busy and self.result_path is not None)
+        self.stop_button.setEnabled(busy)
+
+    def start(self, operation):
+        if self.is_busy or self.source_path is None:
+            return
+        path = self.source_path if operation == 'repair' else self.view_path
+        settings = Settings(self.quality.value(), self.planar.isChecked(), self.angle.value(), self.curved.isChecked())
+        settings.validate()
+        command = ['--worker'] if getattr(sys, 'frozen', False) else ['-u', '-m', 'meshrepair.worker']
+        command += [str(path)]
+        if operation == 'check':
+            command += ['--check']
+        elif operation == 'preview':
+            command += ['--preview-output', str(Path(self.temp.name) / 'view.npz')]
+        else:
+            command += ['--quality', str(settings.quality_mm)]
+            if settings.collapse_coplanar:
+                command += ['--collapse-coplanar', '--coplanar-angle', str(settings.coplanar_angle_deg)]
+            if settings.simplify_curved:
                 command += ['--simplify-curved']
-            self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding='utf-8', errors='replace', env=dict(os.environ, PYTHONIOENCODING='utf-8'),
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-        except Exception as exc:
-            messagebox.showerror('Ошибка запуска', str(exc))
-            return
-        self.finished = self.stopping = False
+        self.operation = operation
+        self.job_path = path
+        self.raw_output = b''
+        self.job_result = None
+        self.job_error = self.stopping = False
         self.started = time.monotonic()
-        self.busy(True)
-        self.progress['value'] = 0
-        self.status.set('Запуск…')
-        self.write('\nИсправление: ' + self.source.get())
-        threading.Thread(target=self.read_worker, args=(self.process,), daemon=True).start()
+        self.progress.setValue(0)
+        self.status.setText({'preview': 'Подготовка предпросмотра…', 'check': 'Проверка сетки…', 'repair': 'Исправление сетки…'}[operation])
+        if operation != 'preview':
+            self.write('\n' + self.status.text() + '\n' + str(path))
+            self.tabs.setCurrentIndex(0)
+        self.set_busy(True)
+        self.clock.start()
+        process = QProcess(self)
+        process.setProcessChannelMode(QProcess.MergedChannels)
+        env = QProcessEnvironment.systemEnvironment()
+        env.insert('PYTHONIOENCODING', 'utf-8')
+        env.insert('PYTHONUNBUFFERED', '1')
+        process.setProcessEnvironment(env)
+        if not getattr(sys, 'frozen', False):
+            process.setWorkingDirectory(str(Path(__file__).resolve().parents[1]))
+        process.readyReadStandardOutput.connect(self.read_worker)
+        process.finished.connect(self.worker_finished)
+        process.errorOccurred.connect(self.process_error)
+        self.process = process
+        process.start(sys.executable, command)
 
-    def read_worker(self, process):
-        for line in process.stdout:
-            self.events.put(line.rstrip())
-        process.stdout.close()
-        self.events.put({'exit': process.wait()})
+    def process_error(self, error):
+        if error == QProcess.FailedToStart:
+            self.write('Не удалось запустить рабочий процесс: ' + self.process.errorString())
+            self.job_error = True
+            self.worker_finished(-1, QProcess.CrashExit)
 
-    def poll(self):
-        if self.process:
-            seconds = int(time.monotonic() - self.started)
-            self.elapsed.set(f'{seconds // 60}:{seconds % 60:02d}')
+    def read_worker(self):
+        if self.process is None:
+            return
+        self.raw_output += bytes(self.process.readAllStandardOutput())
+        while b'\n' in self.raw_output:
+            line, self.raw_output = self.raw_output.split(b'\n', 1)
+            self.handle_line(line.decode('utf-8', errors='replace').rstrip())
+
+    def handle_line(self, line):
         try:
-            while True:
-                event = self.events.get_nowait()
-                if isinstance(event, dict):
-                    if self.stopping and not self.finished:
-                        self.status.set('Остановлено пользователем.')
-                        self.write('Остановлено. Исходный файл не изменён.')
-                    elif not self.finished:
-                        self.status.set('Процесс завершился без результата.')
-                        self.write(f'Процесс завершился (код {event["exit"]}). Возможна ошибка нативной библиотеки или нехватка памяти.')
-                    self.process = None
-                    self.busy(False)
-                    continue
-                try:
-                    item = json.loads(event)
-                except ValueError:
-                    self.write(event)
-                    continue
-                if not isinstance(item, dict) or 'type' not in item:
-                    self.write(event)
-                    continue
-                kind, value = item['type'], item.get('value')
-                if kind == 'progress' and not self.stopping:
-                    self.progress['value'] = value['percent']
-                    self.status.set(f"{value['percent']}% — {value['stage']}")
-                elif kind == 'result':
-                    self.finished = True
-                    self.progress['value'] = 100
-                    self.status.set('Готово. Результат сохранён рядом с исходником.')
-                    d = value['after']
-                    self.write(f"Результат: {value['output']}")
-                    self.write(f"Треугольников: {d['triangles']:,}; замкнутых оболочек: {d['components']}; "
-                               f"дыр: {d['boundary_loops']}; пересекающихся граней: {d['self_intersecting_faces']}.")
-                    for warning in value['warnings']:
-                        self.write(warning)
-                    self.write(f"Время: {value['elapsed_seconds']:.1f} с. Подробности — в JSON рядом с STL.")
-                elif kind == 'error':
-                    self.finished = True
-                    self.status.set('Не удалось завершить исправление.')
-                    self.write(str(value))
-                elif kind == 'log':
-                    self.write(str(value))
-        except queue.Empty:
-            pass
-        self.poll_id = self.root.after(100, self.poll)
+            event = json.loads(line)
+        except ValueError:
+            if line:
+                self.write(line)
+            return
+        if not isinstance(event, dict) or 'type' not in event:
+            self.write(line)
+            return
+        kind, value = event['type'], event.get('value')
+        if kind == 'progress' and not self.stopping:
+            percent = int(value['percent'] * (.8 if self.operation == 'preview' else 1))
+            self.progress.setValue(percent)
+            self.status.setText(f"{percent}% · {value['stage']}")
+        elif kind == 'log':
+            self.write(value)
+        elif kind == 'error':
+            self.job_error = True
+            self.write(value)
+        elif kind == 'result':
+            self.job_result = value
+
+    def worker_finished(self, code, exit_status):
+        if self.process is None:
+            return
+        self.read_worker()
+        if self.raw_output:
+            self.handle_line(self.raw_output.decode('utf-8', errors='replace'))
+            self.raw_output = b''
+        self.process.deleteLater()
+        self.process = None
+        if self.closing:
+            return
+        if self.stopping:
+            self.finish_ui('Остановлено пользователем.')
+            self.write('Остановлено. Исходный файл не изменён.')
+            return
+        if code or self.job_error or self.job_result is None:
+            self.finish_ui('Операция не завершена. Подробности в журнале.')
+            if not self.job_error:
+                self.write(f'Рабочий процесс завершился без результата (код {code}).')
+            return
+        report = self.job_result
+        capability = report.get('acceleration', {})
+        cpu = capability.get('cpu_threads', 'авто')
+        gpu = capability.get('gpu_name', 'CUDA недоступна')
+        self.hardware.setText(f'CPU × {cpu} · ' + ('CUDA' if capability.get('cuda_available') else 'без CUDA'))
+        self.hardware.setToolTip(gpu + '\nCUDA: winding number и проекции. Топология и decimation: CPU.')
+        if self.operation == 'preview':
+            previous = self.reports.get(str(self.job_path), {})
+            if previous.get('checked'):
+                report = dict(report, info=dict(previous['info'], **report['info']), checked=True,
+                              shells=previous.get('shells', []))
+            self.reports[str(self.job_path)] = report
+            self.update_info(report)
+            skipped = report.get('loader', {}).get('skipped_faces', 0)
+            if skipped:
+                self.write(f'Загрузчик пропустил непригодные грани: {skipped}.')
+            self.status.setText('85% · Загрузка геометрии в 3D-окно…')
+            self.progress.setValue(85)
+            self.loader = PreviewLoader(report['preview'], self)
+            self.loader.loaded.connect(self.preview_loaded)
+            self.loader.failed.connect(self.preview_failed)
+            self.loader.finished.connect(self.loader_finished)
+            self.loader.start()
+            return
+        self.progress.setValue(100)
+        self.finish_ui('Готово.')
+        if self.operation == 'check':
+            self.last_check_report = report
+            self.reports[str(self.job_path)] = report
+            self.update_info(report)
+            self.write_inspection(report)
+            self.status.setText('Проверка завершена. Файл не изменён.')
+        else:
+            self.last_repair_report = report
+            self.result_path = Path(report['output'])
+            self.reports[str(self.result_path)] = {'info': report['after'], 'checked': True}
+            info = report['after']
+            self.write(f"Результат: {self.result_path}\nТреугольников: {info['triangles']:,}; оболочек: {info['components']}; дыр: {info['boundary_loops']}; пересекающихся граней: {info['self_intersecting_faces']}.")
+            for warning in report['warnings']:
+                self.write(warning)
+            self.write(f"Время ремонта: {report['elapsed_seconds']:.1f} с. JSON-отчёт сохранён рядом с STL.")
+            self.result_button.setEnabled(True)
+            QTimer.singleShot(0, lambda: self.show_source(True) if not self.closing else None)
+
+    def preview_loaded(self, data):
+        if self.stopping or self.closing:
+            return
+        try:
+            self.view.set_data(data)
+        except RuntimeError as exc:
+            self.preview_failed(str(exc))
+            return
+        self.progress.setValue(100)
+        self.status.setText('Предпросмотр готов. ' + ('Результат ремонта.' if self.view_path == self.result_path else 'Исходная сетка.'))
+
+    def preview_failed(self, message):
+        if not self.closing:
+            self.write('Предпросмотр: ' + message)
+            self.status.setText(message)
+
+    def loader_finished(self):
+        if self.loader:
+            self.loader.deleteLater()
+            self.loader = None
+        if not self.closing:
+            self.clock.stop()
+            self.set_busy(False)
+
+    def finish_ui(self, status):
+        self.clock.stop()
+        self.set_busy(False)
+        self.status.setText(status)
+
+    def update_clock(self):
+        seconds = int(time.monotonic() - self.started)
+        self.elapsed.setText(f'{seconds // 60}:{seconds % 60:02d}')
+
+    def update_info(self, report):
+        info = report.get('info', {})
+        for key, widget in self.stat_labels.items():
+            value = info.get(key)
+            widget.setText(('Да' if value else 'Нет') if key == 'closed' and value is not None
+                           else (f'{value:,}'.replace(',', ' ') if value is not None else '—'))
+        checked = report.get('checked', False)
+        self.check_state.setText('Проверка выполнена' if checked else 'Пересечения ещё не проверены')
+        self.shell_model.set_rows(report.get('shells', []))
+        dimensions = info.get('dimensions_mm')
+        lines = []
+        if dimensions:
+            lines.append('Размеры: ' + ' × '.join(f'{x:.3f}' for x in dimensions) + ' мм')
+        if 'vertices' in info:
+            lines.append(f"Вершин: {info['vertices']:,}".replace(',', ' '))
+        if checked:
+            lines.append(f"Дыр: {info.get('boundary_loops', '—')} · Пересекающихся граней: {info.get('self_intersecting_faces', '—')} · Вырожденных граней: {info.get('degenerate_faces', '—')}")
+            if 'closed_components' in info:
+                lines.append(f"Замкнутых оболочек: {info['closed_components']} · Открытых: {info['open_components']}")
+        else:
+            lines.append('Для полной диагностики нажмите «Check / Проверить».')
+        self.detail_text.setText('\n'.join(lines))
+
+    def write_inspection(self, report):
+        info = report['info']
+        self.write(f"Проверка: {report['source']}\nТреугольников: {info['triangles']:,}; вершин: {info['vertices']:,}; оболочек: {info['components']}.\nЗамкнутых оболочек: {info['closed_components']}; открытых: {info['open_components']}.\nДыр: {info['boundary_loops']}; открытых рёбер: {info['boundary_edges']}; пересекающихся граней: {info['self_intersecting_faces']}; вырожденных: {info['degenerate_faces']}.\nТопология валидна: {'да' if info['topology_valid'] else 'нет'}.\nРазмеры, мм: " + ' × '.join(f'{v:.3f}' for v in info['dimensions_mm']))
+        self.write(f"Площадь: {info['area_mm2']:.3f} мм².")
+        if info['closed'] and not info['self_intersecting_faces']:
+            self.write(f"Объём со знаком: {info['signed_volume_mm3']:.3f} мм³ (вложенные оболочки и ориентация влияют на сумму).")
+        for warning in report['warnings']:
+            self.write(warning)
+        self.write(f"Время проверки: {report['elapsed_seconds']:.1f} с. Детали по оболочкам — на вкладке «Сведения и оболочки».")
 
     def cancel(self):
-        if self.process and self.process.poll() is None and not self.stopping:
-            self.stopping = True
-            self.stop_button.configure(state='disabled')
-            self.status.set('Остановка…')
-            self.process.terminate()
+        if not self.is_busy:
+            return
+        self.stopping = True
+        self.stop_button.setEnabled(False)
+        self.status.setText('Остановка…')
+        if self.process:
+            self.process.kill()
+        if self.loader:
+            self.loader.requestInterruption()
 
-    def close(self):
+    def closeEvent(self, event):
+        self.closing = True
         self.cancel()
         if self.process:
-            self.process.wait(timeout=10)
-        self.root.after_cancel(self.poll_id)
-        self.root.destroy()
+            self.process.waitForFinished(5000)
+        if self.loader:
+            self.loader.wait()
+        if self.preferences:
+            for key, value in [('quality', self.quality.value()), ('angle', self.angle.value()),
+                               ('planar', self.planar.isChecked()), ('curved', self.curved.isChecked())]:
+                self.preferences.setValue(key, value)
+        self.view.shutdown()
+        self.temp.cleanup()
+        event.accept()
 
 
-def main():
-    root = tk.Tk()
-    App(root)
-    root.mainloop()
+def main(smoke=False):
+    app = QApplication.instance() or QApplication(sys.argv[:1])
+    app.setStyle('Fusion')
+    window = App(preview_enabled=not smoke, persist=not smoke)
+    window.show()
+    if smoke:
+        assets = Path(__file__).with_name('assets')
+        assert all((assets / name).is_file() for name in ('check.svg', 'up.svg', 'down.svg'))
+        QTimer.singleShot(100, window.close)
+        QTimer.singleShot(200, app.quit)
+    return app.exec()

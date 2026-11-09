@@ -34,7 +34,7 @@ jobs:
       - run: >-
           python -m pip install --only-binary=:all: -r requirements.txt pyinstaller==6.16.0
       - name: Build portable folder
-        run: python -m PyInstaller --noconfirm --clean --onedir --console --name MeshRepair --collect-all meshlib --hidden-import meshrepair.worker launch.py
+        run: python -m PyInstaller --noconfirm --clean --onedir --console --name MeshRepair --collect-all meshlib --hidden-import meshrepair.worker --hidden-import vtkmodules.qt.QVTKRenderWindowInteractor --add-data "meshrepair/assets;meshrepair/assets" --copy-metadata meshlib --copy-metadata meshlib-core --copy-metadata PySide6-Essentials --copy-metadata shiboken6 --copy-metadata vtk --copy-metadata numpy launch.py
       - name: Check packaged native worker
         run: python tests/check_bundle.py dist/MeshRepair/MeshRepair.exe
       - name: Include instructions and license notices
@@ -44,6 +44,6 @@ jobs:
           copy THIRD_PARTY.md dist\MeshRepair\THIRD_PARTY.md
       - uses: actions/upload-artifact@v4
         with:
-          name: MeshRepair-0.4.0-windows-x64
+          name: MeshRepair-0.5.0-windows-x64
           path: dist/MeshRepair/
           retention-days: 30
