@@ -56,6 +56,8 @@ if __name__ == '__main__':
         assert p.returncode == 0
         report = json.loads(Path(str(target) + '.json').read_text(encoding='utf-8'))
         assert report['simplification']['accepted']
+        assert len(report['simplification']['stages']) == 1
+        assert report['simplification']['stages'][0]['angle_weighted_metric']
         assert report['simplification']['after'] < report['simplification']['before']
         assert report['simplification']['verification']['upper_bound_mm'] <= .02
         assert report['after']['closed']

@@ -19,7 +19,7 @@ from .reporting import report_html
 class App(QMainWindow, LayoutMixin):
     def __init__(self, *, preview_enabled=True, persist=True):
         super().__init__()
-        self.setWindowTitle('MeshRepair 0.6')
+        self.setWindowTitle('MeshRepair 0.7')
         self.setMinimumSize(980, 680)
         screen = QApplication.primaryScreen().availableGeometry()
         self.resize(min(1280, screen.width() - 60), min(880, screen.height() - 70))
@@ -50,6 +50,9 @@ class App(QMainWindow, LayoutMixin):
             self.strict.setChecked(self.preferences.value('strict', False, type=bool))
             self.weld_close.setChecked(self.preferences.value('weld_close', False, type=bool))
         self.set_busy(False)
+
+    def update_reduction_controls(self):
+        self.angle.setEnabled(not self.is_busy and self.planar.isChecked() and not self.curved.isChecked())
 
     def write(self, text):
         self.log.appendPlainText(str(text))
@@ -135,7 +138,7 @@ class App(QMainWindow, LayoutMixin):
         self.is_busy = busy
         for w in (self.browse, self.quality, self.planar, self.curved, self.strict, self.weld_close):
             w.setEnabled(not busy)
-        self.angle.setEnabled(not busy and self.planar.isChecked())
+        self.update_reduction_controls()
         self.repair.setEnabled(not busy and self.source_path is not None)
         self.check_button.setEnabled(not busy and self.view_path is not None)
         self.source_button.setEnabled(not busy and self.source_path is not None)

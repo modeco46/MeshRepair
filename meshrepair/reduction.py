@@ -11,42 +11,59 @@ from .compute import Projector, cpu_count
 
 
 def propose_reduction(mesh, mm, settings, progress, error_scale=1.0):
+    from meshlib import mrmeshnumpy as mn
     candidate = mm.Mesh(mesh)
+    candidate.pack()
+    # Parallel decimation must not even receive the tiny shells. bdVerts alone
+    # did not reliably preserve them in the pinned SDK's partitioned path.
+    mapping, count = mm.MeshComponents.getAllComponentsMap(mm.MeshPart(candidate))
+    groups = np.fromiter((int(x) for x in mapping), dtype=np.int32, count=mapping.size())
+    sizes = np.bincount(groups, minlength=count)
+    small = mn.faceBitSetFromBools(sizes[groups] < 50)
+    protected_count = int(np.count_nonzero(sizes < 50))
+    protected = candidate.cloneRegion(small) if small.count() else None
+    if small.count() == candidate.topology.numValidFaces():
+        return candidate, []
+    if protected is not None:
+        candidate = candidate.cloneRegion(candidate.topology.getValidFaces() - small)
     stages = []
     requested = []
-    if settings.collapse_coplanar:
-        requested.append(('coplanar', settings.coplanar_angle_deg))
+    # A general QEM pass already reduces planar faces. Running a separate
+    # planar pass first resets the metric and spends the error budget twice.
     if settings.simplify_curved:
-        requested.append(('curved', 30.0))
+        requested.append(('curved', None))
+    elif settings.collapse_coplanar:
+        requested.append(('coplanar', settings.coplanar_angle_deg))
     for index, (kind, angle) in enumerate(requested):
         before = candidate.topology.numValidFaces()
         candidate.packOptimally(False)
         params = mm.DecimateSettings()
         # The SDK's maxError is an estimate. Acceptance is decided by the
         # independent surface bound after the actual exported STL is reloaded.
-        params.maxError = settings.quality_mm * .25 * error_scale
+        params.maxError = settings.quality_mm * error_scale
         params.maxAngleChange = -1  # this property controls edge FLIPS, not coplanarity
         params.tinyEdgeLength = 0
         params.optimizeVertexPos = kind != 'coplanar'
-        if kind == 'coplanar':
-            params.stabilizer = 0.0
+        # Angle weighting reduces artificial dependence of QEM on local
+        # triangulation density (in particular the dense voxel seam bands).
+        params.angleWeightedDistToPlane = True
+        params.stabilizer = 0.0 if kind == 'coplanar' else 1e-6
         params.touchBdVerts = False
         params.touchNearBdEdges = True
-        creases = mm.findCreaseEdges(candidate.topology, candidate.points,
-                                    max(math.radians(angle), 1e-7))
-        params.bdVerts = mm.getIncidentVerts(candidate.topology, creases) | candidate.topology.findBdVerts()
-        # Preserve tiny islands completely, including their connectivity.
-        from meshlib import mrmeshnumpy as mn
-        mapping, count = mm.MeshComponents.getAllComponentsMap(mm.MeshPart(candidate))
-        groups = np.fromiter((int(x) for x in mapping), dtype=np.int32, count=mapping.size())
-        sizes = np.bincount(groups, minlength=count)
-        small_faces = mn.faceBitSetFromBools(sizes[groups] < 50)
-        params.bdVerts |= mm.getIncidentVerts(candidate.topology, small_faces)
+        params.bdVerts = candidate.topology.findBdVerts()
         if kind == 'coplanar':
-            params.edgesToCollapse = candidate.topology.findNotLoneUndirectedEdges() - creases
+            creases = mm.findCreaseEdges(candidate.topology, candidate.points,
+                                        max(math.radians(angle), 1e-7))
+            # Keep junctions/corners, but allow collinear ridge vertices to
+            # disappear. Locking every crease vertex leaves a dense seam belt.
+            params.bdVerts |= crease_corners(candidate, creases, mm, mn)
+            params.notFlippable = creases
+            params.collapseNearNotFlippable = True
+        # General simplification is controlled by the distance to the complete
+        # repaired surface, not by locking voxel-generated normal discontinuities.
         params.subdivideParts = min(os.cpu_count() or 1, cpu_count(), max(1, before // 25_000))
         start, end = 78 + 7 * index / len(requested), 78 + 7 * (index + 1) / len(requested)
-        stage = 'Схлопывание плоских участков' if kind == 'coplanar' else 'Упрощение криволинейных участков'
+        stage = 'Схлопывание плоских участков' if kind == 'coplanar' else 'Упрощение всей поверхности в пределах допуска'
         progress.update(start, stage)
         # MeshLib 3.1.4.297 Python callbacks from parallel decimation workers
         # deadlock on the GIL. Keep native parallelism, but report only stage
@@ -59,10 +76,42 @@ def propose_reduction(mesh, mm, settings, progress, error_scale=1.0):
         progress.update(end, stage)
         stages.append({'kind': kind, 'angle_deg': angle, 'before': before,
                        'after': candidate.topology.numValidFaces(),
-                       'native_error_estimate_mm': float(result.errorIntroduced)})
+                       'native_error_estimate_mm': float(result.errorIntroduced),
+                       'angle_weighted_metric': True, 'protected_components': protected_count,
+                       'includes_planar_surfaces': kind == 'curved',
+                       'feature_policy': 'ridge_corners' if kind == 'coplanar' else 'surface_tolerance'})
+    if protected is not None:
+        candidate.addMesh(protected)
     candidate.pack()
     return candidate, stages
 
+
+
+def crease_corners(mesh, creases, mm, mn):
+    """Freeze only branch/end/corner vertices of crease chains.
+
+    On a straight ridge a degree-two vertex can be removed. At a real corner
+    the turn angle is nonzero, so we preserve it. No Python collapse callback
+    is installed (parallel MeshLib callbacks can deadlock the GIL).
+    """
+    verts = mn.getNumpyVerts(mesh)
+    if not creases.count():
+        return mm.VertBitSet()
+    edges = np.fromiter((int(e)*2 for e in creases), dtype=np.int32, count=creases.count())
+    first = np.fromiter((int(mesh.topology.org(mm.EdgeId(int(e)))) for e in edges), dtype=np.int32, count=len(edges))
+    second = np.fromiter((int(mesh.topology.dest(mm.EdgeId(int(e)))) for e in edges), dtype=np.int32, count=len(edges))
+    delta = verts[second].astype(float)-verts[first]
+    length = np.linalg.norm(delta,axis=1)
+    direction = delta/np.maximum(length[:,None],np.finfo(float).tiny)
+    degree = np.bincount(np.r_[first,second],minlength=len(verts))
+    directions = np.zeros((len(verts),3))
+    np.add.at(directions,first,direction)
+    np.add.at(directions,second,-direction)
+    # Only almost-collinear chains are relaxed here. Broader removal of voxel
+    # stair-steps belongs to the tolerance-checked general simplification pass.
+    turn = np.linalg.norm(directions,axis=1)
+    pinned = (degree > 0) & ((degree != 2) | (turn > 2*math.sin(math.radians(1)/2)))
+    return mn.vertBitSetFromBools(pinned)
 
 def triangle_upper_bounds(triangles, targets):
     """For each source triangle, an upper bound to ONE target triangle.

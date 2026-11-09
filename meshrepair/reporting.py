@@ -50,6 +50,9 @@ def report_html(report):
     reduction = report.get('simplification')
     section('Упрощение')
     if reduction:
+        input_count = reduction.get('input_triangles')
+        if input_count is not None:
+            line(f"Исходник → после ремонта → после упрощения: {fmt(input_count)} → {fmt(reduction['before'])} → {fmt(reduction['after'])} треугольников.")
         accepted = reduction.get('accepted')
         percent = 100*(1-reduction['after']/max(1, reduction['before']))
         line(f"{'✓ Принято' if accepted else '✗ Отклонено'}: {reduction['before']:,} → {reduction['after']:,} (−{percent:.1f}%)", '' if accepted else 'bad')

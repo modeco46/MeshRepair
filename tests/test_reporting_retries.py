@@ -37,7 +37,9 @@ def test_strict_rejection_attempts_and_visible_reason(tmp_path,monkeypatch):
     report=run(path,settings=Settings(.02,True,1,False,True))
     result=report['simplification']
     assert not result['accepted']
-    assert [x['max_error_mm'] for x in result['attempts']]==[.005,.0025,.00125]
+    assert 'Исходник → после ремонта → после упрощения' in report_html(report)
+    assert result['input_triangles'] == report['before']['triangles']
+    assert [x['max_error_mm'] for x in result['attempts']]==[.02,.01,.005]
     assert 'verification_work_limit' in report_html(report)
     assert Path(report['output']).exists()
 

@@ -67,11 +67,12 @@ def exercise(name, tmp_path):
             assert window.last_check_report['info']['closed_components'] == 1
             assert window.shell_model.rowCount() == 1
             window.planar.click()
+            assert window.angle.isEnabled()
             window.curved.click()
             assert window.quality.valueFromText('0.02') == .02
             assert window.quality.valueFromText('0,02') == .02
             window.angle.setValue(.5)
-            assert window.angle.isEnabled()
+            assert not window.angle.isEnabled()
             window.repair.click()
             assert not window.angle.isEnabled()
             pump(app, window, lambda: window.last_repair_report is not None and not window.is_busy
@@ -83,6 +84,8 @@ def exercise(name, tmp_path):
             assert window.shell_model.columnCount() == 6
             assert not list(tmp_path.glob('.meshrepair-*'))
             assert window.result_path.is_file()
+            assert not window.angle.isEnabled()
+            window.curved.click()
             assert window.angle.isEnabled()
             window.edge_button.click()
             assert window.view.edges

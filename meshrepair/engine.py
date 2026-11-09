@@ -180,11 +180,11 @@ def simplify_attempts(exported, tmp, mm, settings, tracker, report, emit, workdi
     original = report['after']
     summary = {'requested': True, 'accepted': False, 'before': original['triangles'],
                'after': original['triangles'], 'tolerance_mm': settings.quality_mm,
-               'strict_tolerance': settings.strict_tolerance, 'attempts': []}
+               'strict_tolerance': settings.strict_tolerance, 'input_triangles': report.get('before', {}).get('triangles'), 'attempts': []}
     report['simplification'] = summary
     started = time.monotonic()
     for attempt, factor in enumerate((1., .5, .25), 1):
-        item = {'attempt': attempt, 'max_error_mm': settings.quality_mm*.25*factor}
+        item = {'attempt': attempt, 'max_error_mm': settings.quality_mm*factor}
         summary['attempts'].append(item)
         t = time.monotonic()
         candidate_tmp = Path(workdir) / f'reduction-{attempt}.stl'
@@ -199,6 +199,7 @@ def simplify_attempts(exported, tmp, mm, settings, tracker, report, emit, workdi
             del proposal
             candidate = mm.loadMesh(candidate_tmp)
             candidate_info = diagnostics(candidate, mm, tracker.callback(86, 88, 'Проверка упрощённой сетки'))
+            item['candidate'] = candidate_info
             if not valid(candidate_info):
                 item['reason'] = 'topology_changed'
             elif candidate_info['components'] != original['components']:
@@ -250,6 +251,8 @@ def simplify_attempts(exported, tmp, mm, settings, tracker, report, emit, workdi
         emit('Сохранена сетка без упрощения. ' + summary['reason_ru'])
         report['warnings'].append(summary['reason_ru'])
     emit(f"Упрощение: {summary['before']:,} → {summary['after']:,} треугольников.")
+    if summary['accepted']:
+        emit('Допуск упрощения: ' + ('подтверждён по всей поверхности.' if summary['verification'].get('verified') else 'измерен по вершинам, не доказан для всей поверхности.'))
 
 
 def run(source, destination=None, settings=Settings(), emit=lambda message: None,
@@ -270,7 +273,7 @@ def run(source, destination=None, settings=Settings(), emit=lambda message: None
     from .inspection import describe_mesh
     started = time.monotonic()
     tracker = Progress(progress)
-    report = {'version': '0.6.0', 'settings': asdict(settings), 'source': str(source),
+    report = {'version': '0.7.0', 'settings': asdict(settings), 'source': str(source),
               'units': 'mm', 'tolerance_certified': False, 'warnings': [], 'steps': [],
               'compute_device': 'cpu_native_parallel', 'acceleration': capabilities()}
     load_settings = mm.MeshLoadSettings()
@@ -347,6 +350,7 @@ def run(source, destination=None, settings=Settings(), emit=lambda message: None
     if not valid(after):
         raise RuntimeError(f"Результат не прошёл проверку: дыр {after['boundary_loops']}; пересечений {after['self_intersecting_faces']}. Файл не сохранён.")
     report['steps'].append({'name': 'Проверка результата', 'elapsed_seconds': time.monotonic()-t})
+    emit(f"После ремонта: {info['triangles']:,} → {after['triangles']:,} треугольников; затем выполняется упрощение, если включено.")
     if report['algorithm'] == 'sparse_openvdb_winding':
         cleanup = mm.FixMeshDegeneraciesParams()
         cleanup.mode = mm.FixMeshDegeneraciesParams.Mode.Decimate

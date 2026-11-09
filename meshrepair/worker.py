@@ -14,7 +14,7 @@ def main():
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, 'reconfigure'):
             stream.reconfigure(encoding='utf-8', errors='replace')
-    parser = argparse.ArgumentParser(description='MeshRepair 0.6 — ремонт сеток')
+    parser = argparse.ArgumentParser(description='MeshRepair 0.7 — ремонт сеток')
     parser.add_argument('source')
     parser.add_argument('--output')
     parser.add_argument('--quality', type=float, default=.02)
