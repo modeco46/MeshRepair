@@ -34,7 +34,7 @@ def card(name='card', margins=16):
 
 
 class ShellModel(QAbstractTableModel):
-    headers = ('Оболочка', 'Треугольники', 'Замкнута', 'Открытые рёбра')
+    headers = ('Оболочка', 'Треугольники', 'Замкнута', 'Открытые рёбра', 'Размер bbox, мм', 'Тип')
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -44,7 +44,7 @@ class ShellModel(QAbstractTableModel):
         return 0 if parent.isValid() else len(self.rows)
 
     def columnCount(self, parent=QModelIndex()):
-        return 4
+        return len(self.headers)
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
         if role == Qt.DisplayRole and orientation == Qt.Horizontal:
@@ -56,7 +56,8 @@ class ShellModel(QAbstractTableModel):
             return None
         row = self.rows[index.row()]
         values = (row['id'], f"{row['triangles']:,}".replace(',', ' '),
-                  'Да' if row['closed'] else 'Нет', row['boundary_edges'])
+                  'Да' if row['closed'] else 'Нет', row['boundary_edges'],
+                  ' × '.join(f'{x:.3f}' for x in row.get('bbox_mm', [])), row.get('kind', ''))
         if role == Qt.DisplayRole:
             return str(values[index.column()])
         if role == Qt.ForegroundRole and index.column() == 2:
@@ -103,7 +104,7 @@ class LayoutMixin:
         header.addStretch()
         self.hardware = label('CPU / CUDA · авто', 'badge')
         header.addWidget(self.hardware)
-        header.addWidget(label('0.5', 'muted'))
+        header.addWidget(label('0.6', 'muted'))
         outer.addLayout(header)
 
         body = QHBoxLayout()
@@ -156,6 +157,12 @@ class LayoutMixin:
         layout.addLayout(angle_row)
         self.curved = QCheckBox('Упрощать криволинейные\nучастки в пределах допуска')
         layout.addWidget(self.curved)
+        self.strict = QCheckBox('Строго доказывать допуск')
+        self.strict.setToolTip('Выкл.: допускается измерение по вершинам. Вкл.: требуется численное ограничение всей поверхности.')
+        layout.addWidget(self.strict)
+        self.weld_close = QCheckBox('Склеивать близкие вершины')
+        self.weld_close.setToolTip('Допуск склейки = 0,1 × качество. Может изменить мелкие детали. По умолчанию выключено.')
+        layout.addWidget(self.weld_close)
         layout.addWidget(label('Допуск упрощения отсчитывается\nот уже исправленной поверхности.', 'muted', True))
         left.addWidget(settings)
         footer = QVBoxLayout()
@@ -187,11 +194,13 @@ class LayoutMixin:
         right.setSpacing(12)
         stats = QHBoxLayout()
         self.stat_labels = {}
-        for key, title in [('triangles', 'ТРЕУГОЛЬНИКИ'), ('components', 'ОБОЛОЧКИ'), ('closed', 'ЗАМКНУТОСТЬ')]:
+        for key, title in [('triangles', 'ТРЕУГОЛЬНИКИ'), ('components', 'СВЯЗНЫЕ ЧАСТИ'), ('closed', 'ЗАМКНУТОСТЬ')]:
             frame, layout = card(margins=12)
             value = label('—', 'statValue')
             layout.addWidget(value)
             layout.addWidget(label(title, 'statLabel'))
+            if key == 'components':
+                frame.setToolTip('Связные части топологии после загрузки. Перевёрнутые грани могут отделяться загрузчиком; это не число физических тел. Check покажет эффект согласования.')
             self.stat_labels[key] = value
             stats.addWidget(frame)
         right.addLayout(stats)
@@ -257,6 +266,12 @@ class LayoutMixin:
         self.shell_table.setAlternatingRowColors(True)
         details_layout.addWidget(self.shell_table)
         self.tabs.addTab(details, 'Сведения и оболочки')
+        from PySide6.QtWidgets import QTextBrowser
+        self.report_view = QTextBrowser()
+        self.report_view.setOpenExternalLinks(False)
+        self.report_view.setStyleSheet('QTextBrowser { background: #101b29; color: #dce8f0; border: 1px solid #293a50; border-radius: 8px; padding: 10px; }')
+        self.report_view.setHtml('<p>Нажмите Check или Исправить для отчёта.</p>')
+        self.tabs.addTab(self.report_view, 'Отчёт')
         bottom_layout.addWidget(self.tabs)
         split.addWidget(bottom)
         split.setSizes([450, 220])

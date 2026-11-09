@@ -5,12 +5,12 @@ triangle (both directions), rather than merely checking distances at mesh vertic
 """
 import math
 import os
-from functools import lru_cache
+import ctypes
 import numpy as np
 from .compute import Projector, cpu_count
 
 
-def propose_reduction(mesh, mm, settings, progress):
+def propose_reduction(mesh, mm, settings, progress, error_scale=1.0):
     candidate = mm.Mesh(mesh)
     stages = []
     requested = []
@@ -24,7 +24,7 @@ def propose_reduction(mesh, mm, settings, progress):
         params = mm.DecimateSettings()
         # The SDK's maxError is an estimate. Acceptance is decided by the
         # independent surface bound after the actual exported STL is reloaded.
-        params.maxError = settings.quality_mm * .25
+        params.maxError = settings.quality_mm * .25 * error_scale
         params.maxAngleChange = -1  # this property controls edge FLIPS, not coplanarity
         params.tinyEdgeLength = 0
         params.optimizeVertexPos = kind != 'coplanar'
@@ -35,6 +35,13 @@ def propose_reduction(mesh, mm, settings, progress):
         creases = mm.findCreaseEdges(candidate.topology, candidate.points,
                                     max(math.radians(angle), 1e-7))
         params.bdVerts = mm.getIncidentVerts(candidate.topology, creases) | candidate.topology.findBdVerts()
+        # Preserve tiny islands completely, including their connectivity.
+        from meshlib import mrmeshnumpy as mn
+        mapping, count = mm.MeshComponents.getAllComponentsMap(mm.MeshPart(candidate))
+        groups = np.fromiter((int(x) for x in mapping), dtype=np.int32, count=mapping.size())
+        sizes = np.bincount(groups, minlength=count)
+        small_faces = mn.faceBitSetFromBools(sizes[groups] < 50)
+        params.bdVerts |= mm.getIncidentVerts(candidate.topology, small_faces)
         if kind == 'coplanar':
             params.edgesToCollapse = candidate.topology.findNotLoneUndirectedEdges() - creases
         params.subdivideParts = min(os.cpu_count() or 1, cpu_count(), max(1, before // 25_000))
@@ -165,19 +172,8 @@ def verify_surface_bound(reference, candidate, tolerance, progress=lambda value:
         source_faces, source_verts = faces[direction], vertices[direction]
         target_faces, target_verts = faces[1 - direction], vertices[1 - direction]
         projector = Projector(meshes[1 - direction], mm, acceleration, emit)
-        batch_size = 32768 if projector.gpu else 2048
-        topology = meshes[1 - direction].topology
-
-        @lru_cache(maxsize=8192)
-        def adjacent_quads(face):
-            quads = []
-            for edge in mm.leftRing(topology, mm.FaceId(face)):
-                u, v = int(topology.org(edge)), int(topology.dest(edge))
-                c = next(int(x) for x in target_faces[face] if x != u and x != v)
-                right = int(topology.right(edge))
-                d = next((int(x) for x in target_faces[right] if x != u and x != v), c) if right >= 0 else c
-                quads.append(target_verts[[u, v, c, d]])
-            return np.array(quads)
+        batch_size = 16384
+        neighbors = face_neighbors(target_faces)
 
         for start in range(0, len(source_faces), batch_size):
             initial = source_verts[source_faces[start:start + batch_size]]
@@ -191,21 +187,28 @@ def verify_surface_bound(reference, candidate, tolerance, progress=lambda value:
                 projections = mm.std_vector_MeshProjectionResult()
                 projector.findProjections(projections, mn.fromNumpyArray(centers), None, None,
                                           float(np.finfo(np.float32).max), 0)
-                ids = np.fromiter((int(p.proj.face) for p in projections), dtype=np.int64, count=len(tris))
+                ids, distances = projection_arrays(projections, mm)
                 if (ids < 0).any() or (ids >= len(target_faces)).any():
                     return {'verified': False, 'reason': 'projection_failed'}
                 # A sampled violation may safely reject a proposal; samples alone
                 # are never used to ACCEPT it.
-                distances = np.fromiter((p.distSq for p in projections), dtype=float, count=len(tris))
                 if (distances > tolerance * tolerance).any():
                     return {'verified': False, 'reason': 'sample_exceeds_tolerance', 'checked_subtriangles': checked}
                 bounds = triangle_upper_bounds(tris, target_verts[target_faces[ids]])
                 unresolved = np.flatnonzero(bounds > limit)
                 if len(unresolved):
-                    patches = np.array([adjacent_quads(int(face)) for face in ids[unresolved]])
                     for edge in range(3):
+                        unresolved = np.flatnonzero(bounds > limit)
+                        if not len(unresolved):
+                            break
+                        ids0 = ids[unresolved]
+                        # Edge slots are (0,1), (1,2), (2,0). Adjacent opposite
+                        # vertices are precomputed once, no Python topology walks.
+                        vertices4 = np.column_stack((target_faces[ids0, edge],
+                            target_faces[ids0, (edge+1)%3], target_faces[ids0, (edge+2)%3],
+                            neighbors[ids0, edge]))
                         bounds[unresolved] = np.minimum(bounds[unresolved],
-                            quad_upper_bounds(tris[unresolved], patches[:, edge]))
+                            quad_upper_bounds(tris[unresolved], target_verts[vertices4]))
                 good = np.isfinite(bounds) & (bounds <= limit)
                 if good.any():
                     maximum = max(maximum, float(bounds[good].max()) + margin)
@@ -234,3 +237,59 @@ def verify_surface_bound(reference, candidate, tolerance, progress=lambda value:
             'checked_subtriangles': checked, 'numeric_margin_mm': margin,
             'reference': 'repaired_mesh_before_simplification',
             'method': 'bidirectional_adaptive_convex_patch_bounds'}
+
+
+def face_neighbors(faces):
+    """Opposite vertex across each triangle edge; own opposite at boundaries."""
+    from .orientation import edge_pairs
+    n = len(faces)
+    x, y, _, _, _ = edge_pairs(faces, int(faces.max())+1)
+    result = faces[:, [2, 0, 1]].copy()
+    result[x % n, x // n] = faces[y % n, (y // n + 2) % 3]
+    result[y % n, y // n] = faces[x % n, (x // n + 2) % 3]
+    return result
+
+
+def projection_arrays(projections, mm):
+    """Bulk view of the pinned SDK POD vector, guarded by exported layout offsets.
+
+    MeshLib 3.1.4.297 exports data_pointer and C++ offsetof values. Its record is
+    32 bytes (int32 face, 3 floats, MeshTriPoint, float distance). Unsupported
+    layouts safely use public properties. The vector must outlive these views.
+    """
+    n = len(projections)
+    layout = (mm.MeshProjectionResult._offsetof_proj, mm.PointOnFace._offsetof_face,
+              mm.MeshProjectionResult._offsetof_mtp, mm.MeshProjectionResult._offsetof_distSq)
+    if layout == (0, 0, 16, 28) and n:
+        buffer = (ctypes.c_ubyte * (32*n)).from_address(projections.data_pointer())
+        ids = np.ndarray((n,), dtype=np.int32, buffer=buffer, offset=0, strides=(32,))
+        distances = np.ndarray((n,), dtype=np.float32, buffer=buffer, offset=28, strides=(32,))
+        # Two public accesses check the ABI without a per-projection Python loop.
+        if int(ids[-1]) == int(projections[-1].proj.face) and float(distances[-1]) == float(projections[-1].distSq):
+            return ids, distances
+    return (np.fromiter((int(p.proj.face) for p in projections), dtype=np.int32, count=n),
+            np.fromiter((p.distSq for p in projections), dtype=float, count=n))
+
+
+def measured_distance(reference, candidate, mm):
+    # First argument is the TARGET surface. This samples vertices, not interiors.
+    a, b = mm.MeshPart(reference), mm.MeshPart(candidate)
+    return math.sqrt(max(mm.findMaxDistanceSqOneWay(a, b), mm.findMaxDistanceSqOneWay(b, a)))
+
+
+REASONS = {
+    'topology_changed': 'После упрощения появились дыры или самопересечения.',
+    'kept_shell_count_changed': 'После упрощения изменилось число оболочек.',
+    'sample_exceeds_tolerance': 'Измеренное отклонение превышает заданный допуск.',
+    'distance_not_confirmed': 'Не удалось подтвердить допуск на всей поверхности.',
+    'verification_work_limit': 'Достигнут предел объёма строгой проверки.',
+    'projection_failed': 'Не удалось вычислить проекции для строгой проверки.',
+    'no_reducible_edges': 'При этих ограничениях нет рёбер, доступных для упрощения.',
+    'non_finite_coordinates': 'В координатах обнаружены NaN/inf.',
+    'insufficient_numeric_resolution': 'Недостаточная численная точность координат.',
+    'native_error': 'Нативная библиотека не завершила упрощение.',
+}
+
+
+def reason_text(code):
+    return REASONS.get(code, 'Упрощение не завершено.') + f' [{code}]'

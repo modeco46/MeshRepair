@@ -78,6 +78,10 @@ def exercise(name, tmp_path):
                  and window.view_path == window.result_path and window.view.data is not None)
             assert window.last_repair_report['simplification']['accepted']
             assert window.progress.value() == 100
+            assert '→' in window.stat_labels['triangles'].text()
+            assert 'Упрощение' in window.report_view.toPlainText()
+            assert window.shell_model.columnCount() == 6
+            assert not list(tmp_path.glob('.meshrepair-*'))
             assert window.result_path.is_file()
             assert window.angle.isEnabled()
             window.edge_button.click()
@@ -116,6 +120,11 @@ def exercise(name, tmp_path):
             window.clear_button.click()
             assert not window.log.toPlainText()
         else:
+            window.job_directory = tmp_path / '.meshrepair-owned-test'
+            window.job_directory.mkdir()
+            (window.job_directory/'partial.stl').write_text('partial')
+            unrelated = tmp_path / '.meshrepair-another-instance'
+            unrelated.mkdir()
             window.process = QProcess(window)
             window.process.finished.connect(window.worker_finished)
             window.process.start(sys.executable, ['-c', 'import time;time.sleep(300)'])
@@ -125,6 +134,8 @@ def exercise(name, tmp_path):
             pump(app, window)
             assert window.process is None and window.stopping
             assert 'Остановлено' in window.status.text()
+            assert not (tmp_path/'.meshrepair-owned-test').exists()
+            assert unrelated.is_dir()
     finally:
         window.close()
         app.processEvents()

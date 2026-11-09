@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import shutil
 import time
 from PySide6.QtCore import QTimer, QProcess, QProcessEnvironment, QSettings
 from PySide6.QtGui import QKeySequence, QShortcut
@@ -12,12 +13,13 @@ from .engine import Settings
 from .theme import STYLE
 from .viewer import PreviewLoader
 from .widgets import LayoutMixin
+from .reporting import report_html
 
 
 class App(QMainWindow, LayoutMixin):
     def __init__(self, *, preview_enabled=True, persist=True):
         super().__init__()
-        self.setWindowTitle('MeshRepair 0.5')
+        self.setWindowTitle('MeshRepair 0.6')
         self.setMinimumSize(980, 680)
         screen = QApplication.primaryScreen().availableGeometry()
         self.resize(min(1280, screen.width() - 60), min(880, screen.height() - 70))
@@ -33,6 +35,7 @@ class App(QMainWindow, LayoutMixin):
         self.temp = tempfile.TemporaryDirectory(prefix='meshrepair-preview-')
         self.raw_output = b''
         self.job_result = None
+        self.job_directory = self.job_result_file = None
         self.job_error = False
         self.setup_ui(preview_enabled and os.environ.get('MESHREPAIR_NO_3D') != '1')
         self.clock = QTimer(self)
@@ -44,6 +47,8 @@ class App(QMainWindow, LayoutMixin):
             self.angle.setValue(float(self.preferences.value('angle', 1)))
             self.planar.setChecked(self.preferences.value('planar', False, type=bool))
             self.curved.setChecked(self.preferences.value('curved', False, type=bool))
+            self.strict.setChecked(self.preferences.value('strict', False, type=bool))
+            self.weld_close.setChecked(self.preferences.value('weld_close', False, type=bool))
         self.set_busy(False)
 
     def write(self, text):
@@ -100,6 +105,8 @@ class App(QMainWindow, LayoutMixin):
         self.source_path = self.view_path = path
         self.result_path = None
         self.reports.clear()
+        self.last_repair_report = self.last_check_report = None
+        self.report_view.setHtml(report_html({}))
         self.filename.setText(path.name)
         self.filename.setToolTip(str(path))
         self.view.clear()
@@ -126,7 +133,7 @@ class App(QMainWindow, LayoutMixin):
 
     def set_busy(self, busy):
         self.is_busy = busy
-        for w in (self.browse, self.quality, self.planar, self.curved):
+        for w in (self.browse, self.quality, self.planar, self.curved, self.strict, self.weld_close):
             w.setEnabled(not busy)
         self.angle.setEnabled(not busy and self.planar.isChecked())
         self.repair.setEnabled(not busy and self.source_path is not None)
@@ -139,10 +146,12 @@ class App(QMainWindow, LayoutMixin):
         if self.is_busy or self.source_path is None:
             return
         path = self.source_path if operation == 'repair' else self.view_path
-        settings = Settings(self.quality.value(), self.planar.isChecked(), self.angle.value(), self.curved.isChecked())
+        settings = Settings(self.quality.value(), self.planar.isChecked(), self.angle.value(), self.curved.isChecked(), self.strict.isChecked(), self.weld_close.isChecked())
         settings.validate()
         command = ['--worker'] if getattr(sys, 'frozen', False) else ['-u', '-m', 'meshrepair.worker']
-        command += [str(path)]
+        self.job_directory = Path(tempfile.mkdtemp(prefix='.meshrepair-', dir=path.parent if operation == 'repair' else self.temp.name))
+        self.job_result_file = self.job_directory / 'worker-result.json'
+        command += [str(path), '--result-file', str(self.job_result_file), '--work-dir', str(self.job_directory)]
         if operation == 'check':
             command += ['--check']
         elif operation == 'preview':
@@ -153,6 +162,10 @@ class App(QMainWindow, LayoutMixin):
                 command += ['--collapse-coplanar', '--coplanar-angle', str(settings.coplanar_angle_deg)]
             if settings.simplify_curved:
                 command += ['--simplify-curved']
+            if settings.strict_tolerance:
+                command += ['--strict-tolerance']
+            if settings.weld_close_vertices:
+                command += ['--weld-close-vertices']
         self.operation = operation
         self.job_path = path
         self.raw_output = b''
@@ -167,7 +180,8 @@ class App(QMainWindow, LayoutMixin):
         self.set_busy(True)
         self.clock.start()
         process = QProcess(self)
-        process.setProcessChannelMode(QProcess.MergedChannels)
+        process.setProcessChannelMode(QProcess.SeparateChannels)
+        process.readyReadStandardError.connect(lambda: self.write(bytes(process.readAllStandardError()).decode("utf-8", errors="replace").rstrip()))
         env = QProcessEnvironment.systemEnvironment()
         env.insert('PYTHONIOENCODING', 'utf-8')
         env.insert('PYTHONUNBUFFERED', '1')
@@ -224,6 +238,19 @@ class App(QMainWindow, LayoutMixin):
         if self.raw_output:
             self.handle_line(self.raw_output.decode('utf-8', errors='replace'))
             self.raw_output = b''
+        if not self.stopping and self.job_result_file and self.job_result_file.is_file():
+            try:
+                event = json.loads(self.job_result_file.read_text(encoding='utf-8'))
+                if event.get('type') == 'result':
+                    self.job_result = event['value']
+                    self.job_error = False
+                elif event.get('type') == 'error':
+                    self.job_error = True
+                    self.write(event['value'])
+            except (ValueError, OSError, KeyError) as exc:
+                self.job_error = True
+                self.write('Не удалось прочитать отчёт рабочего процесса: '+str(exc))
+        self.cleanup_job()
         self.process.deleteLater()
         self.process = None
         if self.closing:
@@ -253,6 +280,9 @@ class App(QMainWindow, LayoutMixin):
             skipped = report.get('loader', {}).get('skipped_faces', 0)
             if skipped:
                 self.write(f'Загрузчик пропустил непригодные грани: {skipped}.')
+            duplicated = report.get('loader', {}).get('duplicated_vertices', 0)
+            if duplicated:
+                self.write(f'При загрузке разделены вершины: {duplicated}. Число связных частей может включать перевёрнутые фрагменты. Подробности — Check.')
             self.status.setText('85% · Загрузка геометрии в 3D-окно…')
             self.progress.setValue(85)
             self.loader = PreviewLoader(report['preview'], self)
@@ -265,14 +295,18 @@ class App(QMainWindow, LayoutMixin):
         self.finish_ui('Готово.')
         if self.operation == 'check':
             self.last_check_report = report
+            self.report_view.setHtml(report_html(report))
+            self.tabs.setCurrentWidget(self.report_view)
             self.reports[str(self.job_path)] = report
             self.update_info(report)
             self.write_inspection(report)
             self.status.setText('Проверка завершена. Файл не изменён.')
         else:
             self.last_repair_report = report
+            self.report_view.setHtml(report_html(report))
+            self.tabs.setCurrentWidget(self.report_view)
             self.result_path = Path(report['output'])
-            self.reports[str(self.result_path)] = {'info': report['after'], 'checked': True}
+            self.reports[str(self.result_path)] = {'info': report['after'], 'checked': True, 'shells': report.get('shells', [])}
             info = report['after']
             self.write(f"Результат: {self.result_path}\nТреугольников: {info['triangles']:,}; оболочек: {info['components']}; дыр: {info['boundary_loops']}; пересекающихся граней: {info['self_intersecting_faces']}.")
             for warning in report['warnings']:
@@ -318,8 +352,12 @@ class App(QMainWindow, LayoutMixin):
         info = report.get('info', {})
         for key, widget in self.stat_labels.items():
             value = info.get(key)
-            widget.setText(('Да' if value else 'Нет') if key == 'closed' and value is not None
-                           else (f'{value:,}'.replace(',', ' ') if value is not None else '—'))
+            def formatted(v):
+                return ('Да' if v else 'Нет') if key == 'closed' and v is not None else (f'{v:,}'.replace(',', ' ') if v is not None else '—')
+            if self.last_repair_report and self.view_path == self.result_path:
+                widget.setText(formatted(self.last_repair_report['before'].get(key))+' → '+formatted(value))
+            else:
+                widget.setText(formatted(value))
         checked = report.get('checked', False)
         self.check_state.setText('Проверка выполнена' if checked else 'Пересечения ещё не проверены')
         self.shell_model.set_rows(report.get('shells', []))
@@ -339,13 +377,12 @@ class App(QMainWindow, LayoutMixin):
 
     def write_inspection(self, report):
         info = report['info']
-        self.write(f"Проверка: {report['source']}\nТреугольников: {info['triangles']:,}; вершин: {info['vertices']:,}; оболочек: {info['components']}.\nЗамкнутых оболочек: {info['closed_components']}; открытых: {info['open_components']}.\nДыр: {info['boundary_loops']}; открытых рёбер: {info['boundary_edges']}; пересекающихся граней: {info['self_intersecting_faces']}; вырожденных: {info['degenerate_faces']}.\nТопология валидна: {'да' if info['topology_valid'] else 'нет'}.\nРазмеры, мм: " + ' × '.join(f'{v:.3f}' for v in info['dimensions_mm']))
-        self.write(f"Площадь: {info['area_mm2']:.3f} мм².")
-        if info['closed'] and not info['self_intersecting_faces']:
-            self.write(f"Объём со знаком: {info['signed_volume_mm3']:.3f} мм³ (вложенные оболочки и ориентация влияют на сумму).")
-        for warning in report['warnings']:
-            self.write(warning)
-        self.write(f"Время проверки: {report['elapsed_seconds']:.1f} с. Детали по оболочкам — на вкладке «Сведения и оболочки».")
+        self.write(f"Проверка завершена: {info['triangles']:,} треугольников; {info['components']} связных частей; дыр {info['boundary_loops']}; пересекающихся граней {info['self_intersecting_faces']}. Подробности — вкладка «Отчёт».")
+
+    def cleanup_job(self):
+        if self.job_directory:
+            shutil.rmtree(self.job_directory, ignore_errors=True)
+        self.job_directory = self.job_result_file = None
 
     def cancel(self):
         if not self.is_busy:
@@ -363,11 +400,13 @@ class App(QMainWindow, LayoutMixin):
         self.cancel()
         if self.process:
             self.process.waitForFinished(5000)
+        self.cleanup_job()
         if self.loader:
             self.loader.wait()
         if self.preferences:
             for key, value in [('quality', self.quality.value()), ('angle', self.angle.value()),
-                               ('planar', self.planar.isChecked()), ('curved', self.curved.isChecked())]:
+                               ('planar', self.planar.isChecked()), ('curved', self.curved.isChecked()),
+                               ('strict', self.strict.isChecked()), ('weld_close', self.weld_close.isChecked())]:
                 self.preferences.setValue(key, value)
         self.view.shutdown()
         self.temp.cleanup()

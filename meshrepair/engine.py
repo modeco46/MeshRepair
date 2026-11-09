@@ -6,6 +6,8 @@ import math
 import os
 import tempfile
 import time
+import shutil
+import numpy as np
 from .compute import capabilities, cuda_module
 
 
@@ -15,6 +17,8 @@ class Settings:
     collapse_coplanar: bool = False
     coplanar_angle_deg: float = 1.0
     simplify_curved: bool = False
+    strict_tolerance: bool = False
+    weld_close_vertices: bool = False
 
     def validate(self):
         if not math.isfinite(self.quality_mm) or not .001 <= self.quality_mm <= .5:
@@ -44,12 +48,12 @@ class Progress:
         return lambda value: self.update(start + (end - start) * max(0, min(1, value)), stage)
 
 
-def atomic_json(path, data):
+def atomic_json(path, data, temp_dir=None):
     path = Path(path)
-    fd, tmp = tempfile.mkstemp(prefix=".meshrepair-", suffix=".json", dir=path.parent)
+    fd, tmp = tempfile.mkstemp(prefix=".meshrepair-", suffix=".json", dir=temp_dir or path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2, allow_nan=False)
+            json.dump(clean_json(data), f, ensure_ascii=False, indent=2, allow_nan=False)
         os.replace(tmp, path)
     finally:
         Path(tmp).unlink(missing_ok=True)
@@ -124,12 +128,9 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit):
     params.signDetectionMode = mm.SignDetectionMode.HoleWindingRule
     params.callBack = tracker.callback(42, 65, "Восстановление поверхности")
     report["compute_device"] = "cpu_native_parallel"
-    # Winding sign depends on orientation. Closed operands were oriented earlier;
-    # for fragmented input this is a global heuristic, not a guarantee of inside/outside.
-    if mesh.volume() < 0:
-        mesh = mm.Mesh(mesh)
-        mesh.topology.flipOrientation()
-        report["warnings"].append("Общая ориентация исходной поверхности развёрнута по знаку объёма.")
+    # Safety pass uses individual CLOSED shells, never a global volume sign.
+    from .orientation import orient_closed_components
+    report['sparse_closed_orientation_corrections'] = orient_closed_components(mesh, mm)
     try:
         cuda = cuda_module()
         if cuda is not None:
@@ -152,162 +153,252 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit):
     return result
 
 
+
+def clean_json(value):
+    """Reports remain serializable even when an SDK diagnostic is non-finite."""
+    if isinstance(value, dict):
+        return {str(k): clean_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [clean_json(v) for v in value]
+    if isinstance(value, np.generic):
+        return clean_json(value.item())
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def publish_stl(source, target):
+    # Windows rename is no-replace and works on filesystems without hard links.
+    if os.name == 'nt':
+        os.rename(source, target)
+    else:
+        os.link(source, target)
+
+
+def simplify_attempts(exported, tmp, mm, settings, tracker, report, emit, workdir):
+    from . import reduction as rd
+    original = report['after']
+    summary = {'requested': True, 'accepted': False, 'before': original['triangles'],
+               'after': original['triangles'], 'tolerance_mm': settings.quality_mm,
+               'strict_tolerance': settings.strict_tolerance, 'attempts': []}
+    report['simplification'] = summary
+    started = time.monotonic()
+    for attempt, factor in enumerate((1., .5, .25), 1):
+        item = {'attempt': attempt, 'max_error_mm': settings.quality_mm*.25*factor}
+        summary['attempts'].append(item)
+        t = time.monotonic()
+        candidate_tmp = Path(workdir) / f'reduction-{attempt}.stl'
+        try:
+            proposal, stages = rd.propose_reduction(exported, mm, settings, tracker, error_scale=factor)
+            item['stages'] = stages
+            summary['stages'] = stages
+            if proposal.topology.numValidFaces() >= original['triangles']:
+                item['reason'] = 'no_reducible_edges'
+                break
+            mm.saveMesh(proposal, candidate_tmp)
+            del proposal
+            candidate = mm.loadMesh(candidate_tmp)
+            candidate_info = diagnostics(candidate, mm, tracker.callback(86, 88, 'Проверка упрощённой сетки'))
+            if not valid(candidate_info):
+                item['reason'] = 'topology_changed'
+            elif candidate_info['components'] != original['components']:
+                item['reason'] = 'kept_shell_count_changed'
+            else:
+                try:
+                    verification = rd.verify_surface_bound(exported, candidate, settings.quality_mm,
+                        tracker.callback(88, 96, f'Проверка допуска: попытка {attempt}/3'),
+                        # In measured mode don't spend unbounded time proving a
+                        # result which can be explicitly accepted as sampled.
+                        max_checks=None if settings.strict_tolerance else max(100000, 2*(original['triangles']+candidate_info['triangles'])),
+                        acceleration=report['acceleration'], emit=emit)
+                except RuntimeError as exc:
+                    verification = {'verified': False, 'reason': 'projection_failed', 'detail': str(exc)}
+                if verification.get('verified'):
+                    verification['mode'] = 'proven'
+                    verification['max_deviation_mm'] = verification['upper_bound_mm']
+                elif not settings.strict_tolerance and verification.get('reason') in {
+                        'verification_work_limit', 'distance_not_confirmed', 'projection_failed'}:
+                    deviation = rd.measured_distance(exported, candidate, mm)
+                    if math.isfinite(deviation) and deviation <= settings.quality_mm:
+                        verification = {'verified': False, 'mode': 'measured_not_proven',
+                            'max_deviation_mm': deviation, 'strict_reason': verification.get('reason'),
+                            'reference': 'repaired_mesh_before_simplification',
+                            'method': 'bidirectional_vertices_to_surface'}
+                    else:
+                        verification = {'verified': False, 'reason': 'sample_exceeds_tolerance',
+                                        'max_deviation_mm': deviation}
+                item['verification'] = verification
+                summary['verification'] = verification
+                if verification.get('verified') or verification.get('mode') == 'measured_not_proven':
+                    os.replace(candidate_tmp, tmp)
+                    report['after'] = candidate_info
+                    summary.update(accepted=True, after=candidate_info['triangles'], accepted_attempt=attempt)
+                    if verification['mode'] == 'measured_not_proven':
+                        report['warnings'].append('Допуск упрощения измерен по вершинам в обе стороны, но не доказан для всей поверхности. Для строгой проверки включите соответствующую галочку.')
+                    break
+                item['reason'] = verification.get('reason', 'distance_not_confirmed')
+        except (RuntimeError, MemoryError) as exc:
+            item.update(reason='native_error', detail=str(exc))
+        finally:
+            item['elapsed_seconds'] = time.monotonic()-t
+            candidate_tmp.unlink(missing_ok=True)
+        emit(f"Упрощение, попытка {attempt}: {rd.reason_text(item['reason'])}")
+    summary['elapsed_seconds'] = time.monotonic()-started
+    if not summary['accepted']:
+        summary['reason'] = summary['attempts'][-1].get('reason', 'native_error')
+        summary['reason_ru'] = rd.reason_text(summary['reason'])
+        emit('Сохранена сетка без упрощения. ' + summary['reason_ru'])
+        report['warnings'].append(summary['reason_ru'])
+    emit(f"Упрощение: {summary['before']:,} → {summary['after']:,} треугольников.")
+
+
 def run(source, destination=None, settings=Settings(), emit=lambda message: None,
-        progress=lambda event: None):
+        progress=lambda event: None, work_dir=None):
     settings.validate()
     source = Path(source).resolve()
     if not source.is_file():
-        raise ValueError("Входной файл не найден.")
-    if source.suffix.lower() not in {".stl", ".obj", ".ply"}:
-        raise ValueError("Поддерживаются STL, OBJ и PLY.")
+        raise ValueError('Входной файл не найден.')
+    if source.suffix.lower() not in {'.stl', '.obj', '.ply'}:
+        raise ValueError('Поддерживаются STL, OBJ и PLY.')
     target = Path(destination).resolve() if destination else output_path(source)
-    if target == source or target.exists() or Path(str(target) + ".json").exists():
-        raise ValueError("Выходной файл уже существует. Исходники и результаты не перезаписываются.")
-    if not target.parent.is_dir() or target.suffix.lower() != ".stl":
-        raise ValueError("Нужна существующая папка и новое имя STL.")
-    from meshlib import mrmeshpy as mm
+    if target == source or target.exists() or Path(str(target)+'.json').exists():
+        raise ValueError('Выходной файл уже существует. Исходники и результаты не перезаписываются.')
+    if not target.parent.is_dir() or target.suffix.lower() != '.stl':
+        raise ValueError('Нужна существующая папка и новое имя STL.')
+    from meshlib import mrmeshpy as mm, mrmeshnumpy as mn
+    from .orientation import prepare_orientation, finite_vertices
+    from .inspection import describe_mesh
     started = time.monotonic()
     tracker = Progress(progress)
-    report = {"version": "0.5.0", "settings": asdict(settings), "source": str(source),
-              "units": "mm", "tolerance_certified": False, "warnings": [],
-              "compute_device": "cpu_native_parallel", "acceleration": capabilities()}
+    report = {'version': '0.6.0', 'settings': asdict(settings), 'source': str(source),
+              'units': 'mm', 'tolerance_certified': False, 'warnings': [], 'steps': [],
+              'compute_device': 'cpu_native_parallel', 'acceleration': capabilities()}
     load_settings = mm.MeshLoadSettings()
     skipped, duplicated = mm.int_output(), mm.int_output()
-    load_settings.skippedFaceCount = skipped
-    load_settings.duplicatedVertexCount = duplicated
-    load_settings.callback = tracker.callback(0, 10, "Загрузка сетки")
+    load_settings.skippedFaceCount, load_settings.duplicatedVertexCount = skipped, duplicated
+    load_settings.callback = tracker.callback(0, 5, 'Загрузка сетки')
     mesh = mm.loadMesh(source, load_settings)
-    if mesh.topology.numValidFaces() == 0:
-        raise ValueError("Файл не содержит пригодных треугольников.")
-    report["loader"] = {"skipped_faces": skipped.value, "duplicated_vertices": duplicated.value}
+    finite_vertices(mn.getNumpyVerts(mesh))
+    if not mesh.topology.numValidFaces():
+        raise ValueError('Файл не содержит пригодных треугольников.')
+    mesh.pack()
+    report['loader'] = {'skipped_faces': skipped.value, 'duplicated_vertices': duplicated.value,
+                        'non_finite_vertices': 0}
     if skipped.value:
-        report["warnings"].append(f"Загрузчик пропустил непригодные грани: {skipped.value}. Проверьте форму результата.")
+        report['warnings'].append(f'Загрузчик пропустил непригодные грани: {skipped.value}. Проверьте форму результата.')
     center = mesh.computeBoundingBox().center()
     mesh.transform(mm.AffineXf3f.translation(-center))
-    before = diagnostics(mesh, mm, tracker.callback(10, 18, "Поиск повреждений"))
-    report["before"] = before
-    emit(f"Треугольников: {before['triangles']:,}; оболочек: {before['components']}; "
-         f"дыр: {before['boundary_loops']}; пересекающихся граней: {before['self_intersecting_faces']}.")
+    # Keep the loaded source for final one-way deviation, not just the preconditioned mesh.
+    reference = mm.Mesh(mesh)
+    mesh, orientation = prepare_orientation(mesh, mm,
+        tracker.callback(5, 12, 'Согласование ориентации'),
+        settings.quality_mm*.1 if settings.weld_close_vertices else 0)
+    report['orientation'] = orientation
+    report['steps'].append({'name': 'Согласование ориентации', **orientation})
+    emit(f"Ориентация: несогласованных рёбер {orientation['disoriented_edges']}; фрагментов {orientation['components_before']} → {orientation['components_after']}; {orientation['elapsed_seconds']:.2f} с.")
+    if not orientation['accepted']:
+        report['warnings'].append('Согласование ориентации не принято: ' + orientation.get('reason', 'unknown'))
+    before, shells = describe_mesh(reference, mm, tracker.callback(12, 15, 'Диагностика исходника'))
+    report['before'], report['source_shells'] = before, shells
+    before['disoriented_edges'] = orientation['disoriented_edges']
+    before['skipped_faces'], before['non_finite_vertices'] = skipped.value, 0
+    info = diagnostics(mesh, mm, tracker.callback(15, 18, 'Поиск оставшихся повреждений'))
+    report['prepared'] = info
+    emit(f"После согласования: треугольников {info['triangles']:,}; оболочек {info['components']}; дыр {info['boundary_loops']}.")
     repaired = None
-    # A small topology problem can often be solved without resampling any surface.
-    if before["components"] <= 32 and before["boundary_loops"] <= 32:
+    t = time.monotonic()
+    if info['components'] <= 32 and info['boundary_loops'] <= 32:
         try:
             work = mm.Mesh(mesh)
-            tracker.update(19, "Ремонт поверхностей")
+            tracker.update(19, 'Ремонт поверхностей')
             for edge in list(work.topology.findHoleRepresentiveEdges()):
                 mm.fillHole(work, edge)
-            if before["components"] == 1 and not before["self_intersecting_faces"]:
+            if info['components'] == 1 and not info['self_intersecting_faces']:
                 repaired = work
-                if repaired.volume() < 0:
+                if repaired.topology.isClosed() and repaired.volume() < 0:
                     repaired.topology.flipOrientation()
-                report["algorithm"] = "surface_repair"
+                report['algorithm'] = 'surface_repair'
             else:
                 repaired = union_small(work, mm, tracker)
-                report["algorithm"] = "solid_union"
-                report["warnings"].append("Оболочки объединены как сплошные тела; вложенные поверхности/полости могут быть удалены.")
-            candidate_info = diagnostics(repaired, mm, tracker.callback(40, 42, "Проверка поверхностного ремонта"))
-            if not valid(candidate_info):
+                report['algorithm'] = 'solid_union'
+            if not valid(diagnostics(repaired, mm)):
                 repaired = None
         except RuntimeError as exc:
-            emit("Поверхностного ремонта недостаточно. Перехожу к восстановлению объёма.")
-            report["surface_attempt_error"] = str(exc)
+            report['surface_attempt_error'] = str(exc)
             repaired = None
+    # Closed disjoint solids need neither union nor voxel resampling. This also
+    # preserves tiny islands in sets of >32 bodies and fixes mixed global winding.
+    elif valid(info) and info['boundary_loops'] == 0:
+        repaired = mesh
+        report['algorithm'] = 'closed_components_preserved'
     if repaired is None:
         repaired = sparse_repair(mesh, mm, settings, tracker, report, emit)
-    if repaired is None or repaired.topology.numValidFaces() == 0:
-        raise RuntimeError("Не удалось восстановить непустую поверхность при выбранном качестве. Файл не сохранён.")
-    after = diagnostics(repaired, mm, tracker.callback(65, 70, "Проверка восстановленной сетки"))
+        reason = 'Поверхностного ремонта недостаточно либо слишком много открытых фрагментов/дыр.'
+    else:
+        reason = 'После согласования ориентации поверхность можно обработать без вокселей.'
+    report['algorithm_reason'] = reason
+    report['steps'].append({'name': 'Восстановление поверхности', 'elapsed_seconds': time.monotonic()-t,
+                            'algorithm': report['algorithm'], 'reason': reason})
+    emit(reason)
+    if repaired is None or not repaired.topology.numValidFaces():
+        raise RuntimeError('Не удалось восстановить непустую поверхность при выбранном качестве. Файл не сохранён.')
+    t = time.monotonic()
+    after = diagnostics(repaired, mm, tracker.callback(65, 70, 'Проверка восстановленной сетки'))
     if not valid(after):
-        raise RuntimeError("Восстановленная поверхность не прошла проверку. "
-                           f"Дыр: {after['boundary_loops']}; пересечений: {after['self_intersecting_faces']}. "
-                           "Повреждённый результат не сохранён.")
-    if after["components"] == 1 and repaired.volume() < 0:
-        repaired.topology.flipOrientation()
-    repaired.transform(mm.AffineXf3f.translation(center))
-    if report["algorithm"] == "sparse_openvdb_winding":
+        raise RuntimeError(f"Результат не прошёл проверку: дыр {after['boundary_loops']}; пересечений {after['self_intersecting_faces']}. Файл не сохранён.")
+    report['steps'].append({'name': 'Проверка результата', 'elapsed_seconds': time.monotonic()-t})
+    if report['algorithm'] == 'sparse_openvdb_winding':
         cleanup = mm.FixMeshDegeneraciesParams()
         cleanup.mode = mm.FixMeshDegeneraciesParams.Mode.Decimate
-        cleanup.maxDeviation = settings.quality_mm * .01
-        cleanup.tinyEdgeLength = settings.quality_mm * .001
-        cleanup.cb = tracker.callback(70, 72, "Удаление вырожденных треугольников")
+        cleanup.maxDeviation, cleanup.tinyEdgeLength = settings.quality_mm*.01, settings.quality_mm*.001
+        cleanup.cb = tracker.callback(70, 72, 'Удаление вырожденных треугольников')
         mm.fixMeshDegeneracies(repaired, cleanup)
-    # Original working copies are no longer needed during STL round-trip validation.
+    repaired.transform(mm.AffineXf3f.translation(center))
+    reference.transform(mm.AffineXf3f.translation(center))
     mesh = None
-    work = None
-    fd, tmp = tempfile.mkstemp(prefix=".meshrepair-", suffix=".stl", dir=target.parent)
-    os.close(fd)
-    published = False
+    # GUI creates and owns this one directory; after a kill it cleans only its
+    # own job, never a glob of temporary files belonging to other instances.
+    owned = tempfile.TemporaryDirectory(prefix='.meshrepair-', dir=target.parent) if work_dir is None else None
+    folder = Path(owned.name if owned else work_dir)
+    folder.mkdir(parents=True, exist_ok=True)
+    tmp = folder/'result.stl'
     try:
+        t = time.monotonic()
         save_settings = mm.SaveSettings()
-        save_settings.progress = tracker.callback(72, 74, "Запись результата")
+        save_settings.progress = tracker.callback(72, 74, 'Запись результата')
         mm.saveMesh(repaired, tmp, save_settings)
-        # Validate the actual exported STL, not just the in-memory mesh.
-        del repaired
-        check_settings = mm.MeshLoadSettings()
-        check_settings.callback = tracker.callback(74, 75, "Проверка сохранённого файла")
-        exported = mm.loadMesh(tmp, check_settings)
-        report["after"] = diagnostics(exported, mm, tracker.callback(75, 78, "Контроль результата"))
-        if not valid(report["after"]):
-            raise RuntimeError("STL после сохранения не прошёл проверку: " + str(report["after"]))
+        repaired = None
+        exported = mm.loadMesh(tmp)
+        report['after'] = diagnostics(exported, mm, tracker.callback(75, 78, 'Контроль сохранённого STL'))
+        if not valid(report['after']):
+            raise RuntimeError('STL после сохранения не прошёл проверку.')
+        report['steps'].append({'name': 'Запись и повторная проверка STL', 'elapsed_seconds': time.monotonic()-t})
         if settings.collapse_coplanar or settings.simplify_curved:
-            from .reduction import propose_reduction, verify_surface_bound
-            original_info = report["after"]
-            reduction = {"requested": True, "accepted": False,
-                         "before": original_info["triangles"], "after": original_info["triangles"],
-                         "tolerance_mm": settings.quality_mm}
-            report["simplification"] = reduction
-            candidate_tmp = None
-            try:
-                proposal, stages = propose_reduction(exported, mm, settings, tracker)
-                reduction["stages"] = stages
-                if proposal.topology.numValidFaces() < original_info["triangles"]:
-                    fd2, candidate_tmp = tempfile.mkstemp(prefix=".meshrepair-simplified-", suffix=".stl", dir=target.parent)
-                    os.close(fd2)
-                    proposed_save = mm.SaveSettings()
-                    proposed_save.progress = tracker.callback(85, 86, "Запись упрощённой сетки")
-                    mm.saveMesh(proposal, candidate_tmp, proposed_save)
-                    del proposal
-                    candidate = mm.loadMesh(candidate_tmp)
-                    candidate_info = diagnostics(candidate, mm, tracker.callback(86, 88, "Проверка топологии после упрощения"))
-                    if valid(candidate_info) and candidate_info["components"] == original_info["components"]:
-                        reduction["verification"] = verify_surface_bound(exported, candidate, settings.quality_mm,
-                            tracker.callback(88, 99, "Проверка допуска упрощения в обе стороны"),
-                            acceleration=report['acceleration'], emit=emit)
-                        if reduction["verification"]["verified"]:
-                            os.replace(candidate_tmp, tmp)
-                            candidate_tmp = None
-                            report["after"] = candidate_info
-                            reduction.update(accepted=True, after=candidate_info["triangles"])
-                    else:
-                        reduction["verification"] = {"verified": False, "reason": "topology_changed"}
-                    if not reduction["accepted"]:
-                        emit("Допуск или топология упрощения не подтверждены. Сохраняю исправленную сетку без упрощения.")
-                        report["warnings"].append("Упрощение отклонено; сохранён исправленный вариант до упрощения.")
-                else:
-                    reduction["reason"] = "no_reducible_edges"
-                    emit("Избыточных треугольников при выбранных ограничениях не найдено.")
-            except (RuntimeError, MemoryError) as exc:
-                reduction["reason"] = str(exc)
-                report["warnings"].append("Упрощение не завершилось; сохранён исправленный вариант без упрощения.")
-            finally:
-                if candidate_tmp:
-                    Path(candidate_tmp).unlink(missing_ok=True)
-            emit(f"Упрощение: {reduction['before']:,} → {reduction['after']:,} треугольников.")
-        count = report["after"]["components"]
+            simplify_attempts(exported, tmp, mm, settings, tracker, report, emit, folder)
+        final = mm.loadMesh(tmp)
+        t = time.monotonic()
+        tracker.update(97, 'Измерение отклонения от исходника')
+        deviation = math.sqrt(mm.findMaxDistanceSqOneWay(mm.MeshPart(final), mm.MeshPart(reference)))
+        report['source_deviation'] = {'mode': 'measured_not_proven', 'direction': 'source_vertices_to_result_surface',
+            'max_deviation_mm': deviation, 'warning_threshold_mm': 2*settings.quality_mm,
+            'elapsed_seconds': time.monotonic()-t}
+        if not math.isfinite(deviation) or deviation > 2*settings.quality_mm:
+            report['warnings'].append(f'Отклонение вершин исходника от результата {deviation:.6g} мм больше двух шагов ({2*settings.quality_mm:g} мм). Проверьте потерянные детали, полости и места ремонта.')
+        from .inspection import shell_summary
+        summary, report['shells'] = shell_summary(final, mm)
+        report['after'].update(summary)
+        count = report['after']['components']
         if count > 1:
-            report["warnings"].append(f"В файле {count} замкнутых оболочек. Раздельные детали сохранены; перемычки не добавлялись.")
-        report["status"] = "repaired" if count == 1 else "repaired_multiple_shells"
-        report["output"] = str(target)
-        report["elapsed_seconds"] = time.monotonic() - started
-        # Atomic publication without overwriting another file; same-volume NTFS/POSIX.
-        os.link(tmp, target)
-        published = True
-        atomic_json(str(target) + ".json", report)
-    except BaseException:
-        if published:
-            target.unlink(missing_ok=True)
-        raise
+            report['warnings'].append(f'В файле {count} замкнутых оболочек. Раздельные детали сохранены; перемычки не добавлялись.')
+        report.update(status='repaired' if count == 1 else 'repaired_multiple_shells', output=str(target),
+                      elapsed_seconds=time.monotonic()-started)
+        publish_stl(tmp, target)
+        try:
+            atomic_json(str(target)+'.json', report, temp_dir=folder)
+        except (OSError, ValueError, TypeError) as exc:
+            report['warnings'].append('STL сохранён, но не удалось записать JSON-отчёт: '+str(exc))
     finally:
-        Path(tmp).unlink(missing_ok=True)
-    tracker.update(100, "Готово")
-    return report
+        if owned:
+            owned.cleanup()
+    tracker.update(100, 'Готово')
+    return clean_json(report)

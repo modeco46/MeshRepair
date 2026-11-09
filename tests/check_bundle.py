@@ -61,6 +61,26 @@ if __name__ == '__main__':
         assert report['after']['closed']
         assert report['after']['self_intersecting_faces'] == 0
 
+        # Exercise bundled SciPy sparse graph, local reversed patches and the
+        # separate terminal-result channel inside the actual Windows EXE.
+        from meshlib import mrmeshnumpy as mn
+        import numpy as np
+        vertices, faces = mn.getNumpyVerts(dense), mn.getNumpyFaces(dense.topology).copy()
+        faces[::7] = faces[::7][:, [0,2,1]]
+        reversed_source = Path(folder)/'reversed.obj'
+        reversed_source.write_text(''.join('v %.9g %.9g %.9g\n' % tuple(v) for v in vertices)+
+                                   ''.join('f %d %d %d\n' % tuple(f+1) for f in faces))
+        channel = Path(folder)/'terminal.json'
+        p = subprocess.run([executable,'--worker',str(reversed_source),'--collapse-coplanar',
+                            '--result-file',str(channel)],capture_output=True,encoding='utf-8',errors='replace',timeout=180)
+        assert p.returncode == 0, p.stdout+p.stderr
+        report = json.loads(channel.read_text(encoding='utf-8'))['value']
+        assert report['orientation']['components_before'] > 32
+        assert report['prepared']['components'] == 1
+        assert report['after']['closed']
+        assert report['algorithm'] == 'surface_repair'
+        assert report['simplification']['accepted']
+
         damaged = mm.Mesh()
         for i in range(40):
             part = mm.makeCube(mm.Vector3f(.1, .1, .1), mm.Vector3f(i * .2, 0, 0))
