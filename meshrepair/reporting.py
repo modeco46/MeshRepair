@@ -30,6 +30,8 @@ def report_html(report):
         line('Склейка близких вершин: '+ ('включена, '+fmt(orientation['approximate_weld_mm'])+' мм' if orientation.get('approximate_weld_mm') else 'выключена; только точные совпадения.'))
         if orientation.get('reason'):
             line(orientation['reason'], 'warning')
+    if orientation.get('conflicting_faces'):
+        line(f"⚠ Неориентируемых компонентов: {orientation.get('unoriented_components')}; граней: {orientation['conflicting_faces']}. Они оставлены без согласования.", 'warning')
     if report.get('steps'):
         section('Шаги ремонта')
         names = {'surface_repair': 'Поверхностный ремонт', 'solid_union': 'Булево объединение',
@@ -40,6 +42,12 @@ def report_html(report):
         line(report.get('algorithm_reason', ''))
         if report.get('voxel_size_mm'):
             line('Шаг вокселей: '+fmt(report['voxel_size_mm'])+' мм')
+    holes = report.get('hole_filling')
+    if holes:
+        line(f"Дыры до / после заполнения: {holes['holes_before']} / {holes['holes_after']}; отклонено заплаток: {holes['rejected']}; пропущено: {holes['skipped']}.")
+    sharp = report.get('sharpening')
+    if sharp:
+        line('Восстановление острых рёбер: '+('принято' if sharp.get('accepted') else 'отклонено' if sharp.get('requested') else 'выключено'), '' if sharp.get('accepted') else 'warning')
     after = report.get('after')
     if after:
         section('Результат')
@@ -47,6 +55,12 @@ def report_html(report):
         line('Объём: '+fmt(after.get('signed_volume_mm3'))+' мм³')
         deviation = report.get('source_deviation', {})
         line('Макс. отклонение исходник → результат: '+fmt(deviation.get('max_deviation_mm'))+' мм (измерено по вершинам исходника, не доказано для всей поверхности).')
+        if deviation.get('top10'):
+            line(f"Вершин с отклонением > двух шагов: {deviation.get('exceeding_vertices', 0)}. Кнопка «Отклонения» показывает карту в 3D.", 'warning' if deviation.get('exceeding_vertices') else '')
+            line('Наибольшие отклонения — координаты исходника в мм:')
+            for spot in deviation['top10']:
+                xyz = ', '.join(fmt(v) for v in spot['coordinates_mm'])
+                line(f"({xyz}): {fmt(spot['deviation_mm'])} мм")
     reduction = report.get('simplification')
     section('Упрощение')
     if reduction:

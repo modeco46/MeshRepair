@@ -96,6 +96,9 @@ if __name__ == '__main__':
         print(p.stderr)
         assert p.returncode == 0
         report = json.loads(Path(str(target) + '.json').read_text(encoding='utf-8'))
-        assert report['algorithm'] == 'sparse_openvdb_winding'
+        assert report['algorithm'] == 'closed_components_preserved'
+        assert report['hole_filling']['filled'] == 40
+        assert report['source_deviation']['vertex_count'] > 0
+        assert Path(report['source_deviation']['heatmap_file']).is_file()
         assert report['after']['closed']
         assert report['after']['self_intersecting_faces'] == 0

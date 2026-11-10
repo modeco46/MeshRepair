@@ -81,6 +81,8 @@ def inspect_mesh(source, emit=lambda message: None, progress=lambda event: None)
     info.update(disoriented_edges=orientation['disoriented_edges'], non_finite_vertices=0,
                 skipped_faces=loader['skipped_faces'])
     warnings = []
+    if orientation.get('conflicting_faces'):
+        warnings.append(f"Неориентируемых компонентов: {orientation['unoriented_components']}; граней пропущено при согласовании: {orientation['conflicting_faces']}. Остальные компоненты обработаны.")
     if loader['skipped_faces']:
         warnings.append(f"Загрузчик пропустил непригодные грани: {loader['skipped_faces']}. Проверьте исходную модель.")
     if orientation['disoriented_edges']:
@@ -112,4 +114,5 @@ def export_preview(source, destination, progress=lambda event: None):
     tracker.update(100, 'Предпросмотр подготовлен')
     return {'operation': 'preview', 'source': str(source), 'preview': str(destination),
             'checked': False, 'info': info, 'loader': loader, 'acceleration': capabilities(),
+            'center_mm': [center.x, center.y, center.z],
             'elapsed_seconds': time.monotonic() - started}

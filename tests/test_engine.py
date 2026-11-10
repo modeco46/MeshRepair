@@ -96,7 +96,7 @@ def test_hole_not_blocked_by_perimeter(tmp_path):
     assert report['after']['closed']
 
 
-def test_1150_open_components_use_sparse_reconstruction(tmp_path):
+def test_1150_open_components_fill_before_reconstruction(tmp_path):
     mesh = mm.Mesh()
     for index in range(1150):
         part = cube(.04)
@@ -108,7 +108,8 @@ def test_1150_open_components_use_sparse_reconstruction(tmp_path):
     report = run(save(tmp_path, mesh), settings=Settings(.005), progress=events.append)
     assert report['before']['components'] == 1150
     assert report['before']['boundary_loops'] == 1150
-    assert report['algorithm'] == 'sparse_openvdb_winding'
+    assert report['algorithm'] == 'closed_components_preserved'
+    assert report['hole_filling']['filled'] == 1150
     assert report['after']['closed']
     assert report['after']['self_intersecting_faces'] == 0
     assert report['after']['components'] == 1150

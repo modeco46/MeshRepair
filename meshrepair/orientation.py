@@ -51,14 +51,16 @@ def orient_consistently(verts, faces):
     graph = coo_matrix((np.ones(len(row), np.int8), (row, col)), shape=(2*n, 2*n)).tocsr()
     _, parity = connected_components(graph, directed=False)
     conflict = parity[:n] == parity[n:]
-    if conflict.any():
-        return faces.copy(), {'accepted': False, 'reason': 'orientation_conflict',
-                              'disoriented_edges': int(bad.sum()), 'conflicting_faces': int(conflict.sum())}
-    flip = parity[:n] > parity[n:]
+    # A non-orientable component joins the two sheets. Leave only those
+    # faces untouched; the other components still have a valid parity solution.
+    flip = (parity[:n] > parity[n:]) & ~conflict
     _, labels = np.unique(np.minimum(parity[:n], parity[n:]), return_inverse=True)
     labels = labels.astype(np.int32)
     ncomp = int(labels.max()) + 1
     closed = np.ones(ncomp, bool)
+    unoriented = np.zeros(ncomp, bool)
+    unoriented[labels[conflict]] = True
+    closed[unoriented] = False
     closed[labels[boundary % n]] = False
     # An ambiguous edge can involve more than the first face: mark all touched
     # components open, so volume is never used to orient a non-manifold component.
@@ -86,9 +88,13 @@ def orient_consistently(verts, faces):
     # Closed shells become positive solids; open patches keep the area-majority
     # input orientation (a heuristic, explicitly not an inside/outside proof).
     reverse = np.where(closed, volume < 0, changed_area > area*.5)
-    mask = reverse[labels]
+    mask = reverse[labels] & ~conflict
     out[mask] = out[mask][:, [0, 2, 1]]
-    return out, {'accepted': True, 'disoriented_edges': int(bad.sum()),
+    return out, {'accepted': True, 'partial': bool(conflict.any()),
+                 'conflicting_faces': int(conflict.sum()),
+                 'unoriented_components': int(unoriented.sum()),
+                 'unoriented_component_faces': np.bincount(labels, minlength=ncomp)[unoriented].tolist(),
+                 'disoriented_edges': int(bad.sum()),
                  'components': ncomp, 'closed_components': int(closed.sum()),
                  'open_components': int((~closed).sum()),
                  'nonmanifold_edges': int(np.count_nonzero(edge_counts > 2)),

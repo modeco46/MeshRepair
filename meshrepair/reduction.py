@@ -299,25 +299,36 @@ def face_neighbors(faces):
     return result
 
 
-def projection_arrays(projections, mm):
-    """Bulk view of the pinned SDK POD vector, guarded by exported layout offsets.
+class ProjectionLayoutError(ValueError):
+    """Pinned native ABI differs; never silently degrade to a Python loop."""
 
-    MeshLib 3.1.4.297 exports data_pointer and C++ offsetof values. Its record is
-    32 bytes (int32 face, 3 floats, MeshTriPoint, float distance). Unsupported
-    layouts safely use public properties. The vector must outlive these views.
-    """
-    n = len(projections)
-    layout = (mm.MeshProjectionResult._offsetof_proj, mm.PointOnFace._offsetof_face,
-              mm.MeshProjectionResult._offsetof_mtp, mm.MeshProjectionResult._offsetof_distSq)
-    if layout == (0, 0, 16, 28) and n:
-        buffer = (ctypes.c_ubyte * (32*n)).from_address(projections.data_pointer())
+
+def projection_arrays(projections, mm):
+    """Guard the SDK's 32-byte POD records before exposing NumPy views."""
+    message = ('Несовместимая раскладка проекций MeshLib. Требуется версия '
+               '3.1.4.297; переустановите зависимости или обновите приложение. '
+               '[projection_layout_mismatch]')
+    try:
+        layout = (mm.MeshProjectionResult._offsetof_proj, mm.PointOnFace._offsetof_face,
+                  mm.MeshProjectionResult._offsetof_mtp, mm.MeshProjectionResult._offsetof_distSq)
+        if layout != (0, 0, 16, 28):
+            raise ProjectionLayoutError(message)
+        n = len(projections)
+        if not n:
+            return np.empty(0, np.int32), np.empty(0, np.float32)
+        pointer = projections.data_pointer()
+        if not pointer:
+            raise ProjectionLayoutError(message)
+        buffer = (ctypes.c_ubyte * (32*n)).from_address(pointer)
         ids = np.ndarray((n,), dtype=np.int32, buffer=buffer, offset=0, strides=(32,))
         distances = np.ndarray((n,), dtype=np.float32, buffer=buffer, offset=28, strides=(32,))
-        # Two public accesses check the ABI without a per-projection Python loop.
-        if int(ids[-1]) == int(projections[-1].proj.face) and float(distances[-1]) == float(projections[-1].distSq):
-            return ids, distances
-    return (np.fromiter((int(p.proj.face) for p in projections), dtype=np.int32, count=n),
-            np.fromiter((p.distSq for p in projections), dtype=float, count=n))
+        for i in {0, n-1}:
+            if int(ids[i]) != int(projections[i].proj.face) or not np.isclose(
+                    distances[i], projections[i].distSq, rtol=0, atol=0, equal_nan=True):
+                raise ProjectionLayoutError(message)
+        return ids, distances
+    except (AttributeError, TypeError) as exc:
+        raise ProjectionLayoutError(message) from exc
 
 
 def measured_distance(reference, candidate, mm):

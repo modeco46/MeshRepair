@@ -14,7 +14,7 @@ def main():
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, 'reconfigure'):
             stream.reconfigure(encoding='utf-8', errors='replace')
-    parser = argparse.ArgumentParser(description='MeshRepair 0.7 — ремонт сеток')
+    parser = argparse.ArgumentParser(description='MeshRepair 0.8 — ремонт сеток')
     parser.add_argument('source')
     parser.add_argument('--output')
     parser.add_argument('--quality', type=float, default=.02)
@@ -23,6 +23,7 @@ def main():
     parser.add_argument('--simplify-curved', action='store_true')
     parser.add_argument('--strict-tolerance', action='store_true')
     parser.add_argument('--weld-close-vertices', action='store_true')
+    parser.add_argument('--no-restore-sharp-edges', action='store_true')
     parser.add_argument('--result-file')
     parser.add_argument('--work-dir')
     parser.add_argument('--debug', action='store_true')
@@ -46,7 +47,7 @@ def main():
             result = export_preview(args.source, args.preview_output, progress)
         else:
             settings = Settings(args.quality, args.collapse_coplanar, args.coplanar_angle,
-                                args.simplify_curved, args.strict_tolerance, args.weld_close_vertices)
+                                args.simplify_curved, args.strict_tolerance, args.weld_close_vertices, not args.no_restore_sharp_edges)
             result = run(args.source, args.output, settings, log, progress, work_dir=args.work_dir)
         terminal('result', result)
         return 0

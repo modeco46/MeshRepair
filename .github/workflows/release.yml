@@ -1,0 +1,36 @@
+name: Publish tested Windows release
+on:
+  push:
+    tags: ['v*']
+  workflow_run:
+    workflows: ['Check and build Windows app']
+    types: [completed]
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  release:
+    if: >-
+      github.event_name == 'push' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    concurrency: meshrepair-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Publish existing tested artifact for this tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+          RELEASE_NEW_VERSION: ${{ github.event_name == 'workflow_run' }}
+        run: python scripts/publish_release.py

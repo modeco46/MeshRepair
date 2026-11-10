@@ -78,6 +78,13 @@ def exercise(name, tmp_path):
             pump(app, window, lambda: window.last_repair_report is not None and not window.is_busy
                  and window.view_path == window.result_path and window.view.data is not None)
             assert window.last_repair_report['simplification']['accepted']
+            assert window.sharp.isChecked()
+            assert window.last_repair_report['settings']['restore_sharp_edges']
+            assert window.heatmap_button.isEnabled()
+            assert window.view.heatmap_data.GetNumberOfPoints() > 0
+            window.heatmap_button.click()
+            assert window.view.heatmap_visible
+            assert not window.heatmap_legend.isHidden()
             assert window.progress.value() == 100
             assert '→' in window.stat_labels['triangles'].text()
             assert 'Упрощение' in window.report_view.toPlainText()

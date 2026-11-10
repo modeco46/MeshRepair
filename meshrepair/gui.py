@@ -19,7 +19,7 @@ from .reporting import report_html
 class App(QMainWindow, LayoutMixin):
     def __init__(self, *, preview_enabled=True, persist=True):
         super().__init__()
-        self.setWindowTitle('MeshRepair 0.7')
+        self.setWindowTitle('MeshRepair 0.8')
         self.setMinimumSize(980, 680)
         screen = QApplication.primaryScreen().availableGeometry()
         self.resize(min(1280, screen.width() - 60), min(880, screen.height() - 70))
@@ -49,6 +49,7 @@ class App(QMainWindow, LayoutMixin):
             self.curved.setChecked(self.preferences.value('curved', False, type=bool))
             self.strict.setChecked(self.preferences.value('strict', False, type=bool))
             self.weld_close.setChecked(self.preferences.value('weld_close', False, type=bool))
+            self.sharp.setChecked(self.preferences.value('sharp', True, type=bool))
         self.set_busy(False)
 
     def update_reduction_controls(self):
@@ -67,6 +68,10 @@ class App(QMainWindow, LayoutMixin):
     def show_renderer(self, name):
         self.render_label.setToolTip('Устройство отображения OpenGL: ' + name)
         self.write('3D-отображение: ' + name)
+
+    def update_heatmap(self):
+        self.view.set_heatmap(self.heatmap_button.isChecked())
+        self.heatmap_legend.setVisible(self.heatmap_button.isChecked() and self.view.heatmap_data is not None)
 
     def update_view(self):
         self.view.set_mode(self.surface_button.isChecked(), self.edge_button.isChecked())
@@ -109,6 +114,8 @@ class App(QMainWindow, LayoutMixin):
         self.result_path = None
         self.reports.clear()
         self.last_repair_report = self.last_check_report = None
+        self.heatmap_button.setChecked(False)
+        self.update_heatmap()
         self.report_view.setHtml(report_html({}))
         self.filename.setText(path.name)
         self.filename.setToolTip(str(path))
@@ -136,7 +143,7 @@ class App(QMainWindow, LayoutMixin):
 
     def set_busy(self, busy):
         self.is_busy = busy
-        for w in (self.browse, self.quality, self.planar, self.curved, self.strict, self.weld_close):
+        for w in (self.browse, self.quality, self.planar, self.curved, self.strict, self.weld_close, self.sharp):
             w.setEnabled(not busy)
         self.update_reduction_controls()
         self.repair.setEnabled(not busy and self.source_path is not None)
@@ -144,12 +151,13 @@ class App(QMainWindow, LayoutMixin):
         self.source_button.setEnabled(not busy and self.source_path is not None)
         self.result_button.setEnabled(not busy and self.result_path is not None)
         self.stop_button.setEnabled(busy)
+        self.heatmap_button.setEnabled(not busy and self.view.heatmap_data is not None)
 
     def start(self, operation):
         if self.is_busy or self.source_path is None:
             return
         path = self.source_path if operation == 'repair' else self.view_path
-        settings = Settings(self.quality.value(), self.planar.isChecked(), self.angle.value(), self.curved.isChecked(), self.strict.isChecked(), self.weld_close.isChecked())
+        settings = Settings(self.quality.value(), self.planar.isChecked(), self.angle.value(), self.curved.isChecked(), self.strict.isChecked(), self.weld_close.isChecked(), self.sharp.isChecked())
         settings.validate()
         command = ['--worker'] if getattr(sys, 'frozen', False) else ['-u', '-m', 'meshrepair.worker']
         self.job_directory = Path(tempfile.mkdtemp(prefix='.meshrepair-', dir=path.parent if operation == 'repair' else self.temp.name))
@@ -169,6 +177,8 @@ class App(QMainWindow, LayoutMixin):
                 command += ['--strict-tolerance']
             if settings.weld_close_vertices:
                 command += ['--weld-close-vertices']
+            if not settings.restore_sharp_edges:
+                command += ['--no-restore-sharp-edges']
         self.operation = operation
         self.job_path = path
         self.raw_output = b''
@@ -288,7 +298,8 @@ class App(QMainWindow, LayoutMixin):
                 self.write(f'При загрузке разделены вершины: {duplicated}. Число связных частей может включать перевёрнутые фрагменты. Подробности — Check.')
             self.status.setText('85% · Загрузка геометрии в 3D-окно…')
             self.progress.setValue(85)
-            self.loader = PreviewLoader(report['preview'], self)
+            heatmap = (self.last_repair_report or {}).get('source_deviation', {}).get('heatmap_file')
+            self.loader = PreviewLoader(report['preview'], self, heatmap=heatmap, center=report.get('center_mm', [0, 0, 0]))
             self.loader.loaded.connect(self.preview_loaded)
             self.loader.failed.connect(self.preview_failed)
             self.loader.finished.connect(self.loader_finished)
@@ -323,6 +334,9 @@ class App(QMainWindow, LayoutMixin):
             return
         try:
             self.view.set_data(data)
+            self.update_heatmap()
+            if getattr(data, '_heatmap_error', None):
+                self.write('Карта отклонения: '+data._heatmap_error)
         except RuntimeError as exc:
             self.preview_failed(str(exc))
             return
@@ -409,7 +423,7 @@ class App(QMainWindow, LayoutMixin):
         if self.preferences:
             for key, value in [('quality', self.quality.value()), ('angle', self.angle.value()),
                                ('planar', self.planar.isChecked()), ('curved', self.curved.isChecked()),
-                               ('strict', self.strict.isChecked()), ('weld_close', self.weld_close.isChecked())]:
+                               ('strict', self.strict.isChecked()), ('weld_close', self.weld_close.isChecked()), ('sharp', self.sharp.isChecked())]:
                 self.preferences.setValue(key, value)
         self.view.shutdown()
         self.temp.cleanup()

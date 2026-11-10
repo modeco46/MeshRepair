@@ -1,5 +1,6 @@
 """Exercise the real Qt/VTK bridge with an X11 GLX context (CI uses Xvfb/Mesa)."""
 from pathlib import Path
+import tempfile
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
@@ -8,7 +9,7 @@ from meshlib import mrmeshpy as mm, mrmeshnumpy as mn
 from vtkmodules.vtkRenderingCore import vtkWindowToImageFilter
 from vtkmodules.util.numpy_support import vtk_to_numpy
 from meshrepair.gui import App
-from meshrepair.viewer import polydata_from_arrays
+from meshrepair.viewer import polydata_from_arrays, heatmap_polydata
 
 
 def pixels(window):
@@ -32,6 +33,17 @@ if __name__ == '__main__':
         window = ui.view.vtk.GetRenderWindow()
         assert window.SupportsOpenGL()
         solid = pixels(window)
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/'map.npz'
+            vertices = mn.getNumpyVerts(mesh)
+            np.savez(path, vertices=vertices, distances_mm=np.full(len(vertices), .1), threshold_mm=.04)
+            data._heatmap = heatmap_polydata(path, [0,0,0])
+        ui.view.set_data(data)
+        ui.view.set_heatmap(True)
+        app.processEvents()
+        assert np.count_nonzero(pixels(window) != solid) > 1000
+        ui.view.set_heatmap(False)
+        app.processEvents()
         assert solid.max() > 100
         ui.edge_button.click()
         app.processEvents()

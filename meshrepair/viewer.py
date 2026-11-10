@@ -31,13 +31,45 @@ def polydata_from_arrays(vertices, faces):
     return data
 
 
+def heatmap_polydata(path, center):
+    """Original-space vertex cloud, aligned with either preview's own center."""
+    from vtkmodules.util.numpy_support import numpy_to_vtk
+    from vtkmodules.vtkCommonCore import vtkPoints
+    from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPolyData
+    with np.load(path, allow_pickle=False) as archive:
+        vertices = archive['vertices'].astype(np.float32)-np.asarray(center, np.float32)
+        distances = archive['distances_mm']
+        threshold = float(archive['threshold_mm'])
+    if (vertices.ndim != 2 or vertices.shape[1] != 3 or distances.shape != (len(vertices),)
+            or not np.isfinite(vertices).all() or not np.isfinite(distances).all() or threshold <= 0):
+        raise ValueError('Некорректная карта отклонения.')
+    ratio = np.clip(distances/threshold, 0, 1)
+    colors = np.column_stack((40+215*ratio, 110+100*ratio, 220-150*ratio)).astype(np.uint8)
+    colors[distances > threshold] = [255, 45, 45]
+    vertices = np.ascontiguousarray(vertices)
+    points = vtkPoints()
+    points.SetData(numpy_to_vtk(vertices, deep=False))
+    offsets = np.arange(len(vertices)+1, dtype=np.int32)
+    ids = np.arange(len(vertices), dtype=np.int32)
+    cells = vtkCellArray()
+    cells.SetData(numpy_to_vtk(offsets, deep=False), numpy_to_vtk(ids, deep=False))
+    data = vtkPolyData()
+    data.SetPoints(points)
+    data.SetVerts(cells)
+    data.GetPointData().SetScalars(numpy_to_vtk(colors, deep=False))
+    data._buffers = (vertices, offsets, ids, colors)
+    data._threshold_mm = threshold
+    return data
+
+
 class PreviewLoader(QThread):
     loaded = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, path, parent=None):
+    def __init__(self, path, parent=None, heatmap=None, center=(0, 0, 0)):
         super().__init__(parent)
         self.path = Path(path)
+        self.heatmap, self.center = heatmap, center
 
     def run(self):
         try:
@@ -47,6 +79,12 @@ class PreviewLoader(QThread):
                 self.failed.emit('Загрузка предпросмотра остановлена.')
                 return
             data = polydata_from_arrays(vertices, faces)
+            data._heatmap = None
+            if self.heatmap:
+                try:
+                    data._heatmap = heatmap_polydata(self.heatmap, self.center)
+                except (OSError, ValueError, KeyError) as exc:
+                    data._heatmap_error = str(exc)
             if self.isInterruptionRequested():
                 self.failed.emit('Загрузка предпросмотра остановлена.')
             else:
@@ -89,6 +127,8 @@ class MeshView(QWidget):
         super().__init__(parent)
         self.data = None
         self.surface, self.edges = True, False
+        self.heatmap_data = None
+        self.heatmap_visible = False
         self.enabled = enabled
         self.vtk = None
         layout = QVBoxLayout(self)
@@ -104,6 +144,15 @@ class MeshView(QWidget):
         from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
         from vtkmodules.vtkInteractionStyle import vtkInteractorStyleTrackballCamera
         self.renderer, self.mapper, self.actor = make_scene()
+        from vtkmodules.vtkRenderingCore import vtkPolyDataMapper, vtkActor
+        self.heatmap_mapper = vtkPolyDataMapper()
+        self.heatmap_mapper.SetColorModeToDirectScalars()
+        self.heatmap_actor = vtkActor()
+        self.heatmap_actor.SetMapper(self.heatmap_mapper)
+        self.heatmap_actor.GetProperty().SetPointSize(4)
+        self.heatmap_actor.GetProperty().LightingOff()
+        self.heatmap_actor.SetVisibility(False)
+        self.renderer.AddActor(self.heatmap_actor)
         self.vtk = QVTKRenderWindowInteractor(self)
         self.vtk.setAcceptDrops(False)
         self.vtk.GetRenderWindow().SetMultiSamples(0)
@@ -121,10 +170,13 @@ class MeshView(QWidget):
 
     def set_data(self, data):
         self.data = data  # Keep NumPy buffers alive as long as VTK uses them.
+        self.heatmap_data = getattr(data, '_heatmap', None)
         if not self.enabled:
             return
         self.initialize()
         self.mapper.SetInputData(data)
+        self.heatmap_mapper.SetInputData(self.heatmap_data)
+        self.set_heatmap(self.heatmap_visible)
         self.set_mode(self.surface, self.edges)
         self.fit('iso')
         try:
@@ -138,8 +190,19 @@ class MeshView(QWidget):
 
     def clear(self):
         self.data = None
+        self.heatmap_data = None
+        if self.enabled:
+            self.heatmap_mapper.SetInputData(None)
+            self.heatmap_actor.SetVisibility(False)
         if self.enabled:
             self.mapper.SetInputData(None)
+            if self.initialized:
+                self.vtk.GetRenderWindow().Render()
+
+    def set_heatmap(self, visible):
+        self.heatmap_visible = bool(visible)
+        if self.enabled:
+            self.heatmap_actor.SetVisibility(visible and self.heatmap_data is not None)
             if self.initialized:
                 self.vtk.GetRenderWindow().Render()
 

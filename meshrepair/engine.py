@@ -19,6 +19,7 @@ class Settings:
     simplify_curved: bool = False
     strict_tolerance: bool = False
     weld_close_vertices: bool = False
+    restore_sharp_edges: bool = True
 
     def validate(self):
         if not math.isfinite(self.quality_mm) or not .001 <= self.quality_mm <= .5:
@@ -123,34 +124,55 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit):
     """
     report["algorithm"] = "sparse_openvdb_winding"
     report["voxel_size_mm"] = settings.quality_mm
-    params = mm.OffsetParameters()
-    params.voxelSize = settings.quality_mm
-    params.signDetectionMode = mm.SignDetectionMode.HoleWindingRule
-    params.callBack = tracker.callback(42, 65, "Восстановление поверхности")
-    report["compute_device"] = "cpu_native_parallel"
-    # Safety pass uses individual CLOSED shells, never a global volume sign.
     from .orientation import orient_closed_components
     report['sparse_closed_orientation_corrections'] = orient_closed_components(mesh, mm)
+    report['sharpening'] = {'requested': settings.restore_sharp_edges, 'accepted': False}
+    report['compute_device'] = 'cpu_native_parallel'
+    winding = None
     try:
         cuda = cuda_module()
         if cuda is not None:
-            params.fwn = cuda.FastWindingNumber(mesh)
-            report["compute_device"] = "cuda_winding_with_cpu_openvdb"
+            winding = cuda.FastWindingNumber(mesh)
     except Exception as exc:
-        report["warnings"].append(f"CUDA недоступна, используется CPU: {exc}")
-    emit(f"Разреженное восстановление; шаг {settings.quality_mm:g} мм. "
-         "Мелкий шаг может потребовать много времени и памяти; остановка доступна.")
-    try:
-        result = mm.offsetMesh(mm.MeshPart(mesh), 0, params)
-    except RuntimeError as exc:
-        if params.fwn is None:
-            raise
-        report["warnings"].append(f"Ошибка CUDA; повтор на CPU: {exc}")
-        emit("GPU не завершил расчёт. Повтор на CPU с тем же качеством.")
-        params.fwn = None
-        report["compute_device"] = "cpu_native_parallel"
-        result = mm.offsetMesh(mm.MeshPart(mesh), 0, params)
-    return result
+        report['warnings'].append(f'CUDA недоступна, используется CPU: {exc}')
+
+    def reconstruct(sharp):
+        params = mm.GeneralOffsetParameters() if sharp else mm.OffsetParameters()
+        params.voxelSize = settings.quality_mm
+        params.signDetectionMode = mm.SignDetectionMode.HoleWindingRule
+        params.callBack = tracker.callback(42, 65, 'Восстановление острых рёбер' if sharp else 'Восстановление поверхности')
+        params.fwn = winding
+        if sharp:
+            params.mode = mm.GeneralOffsetParametersMode.Sharpening
+        operation = mm.generalOffsetMesh if sharp else mm.offsetMesh
+        report['compute_device'] = 'cuda_winding_with_cpu_openvdb' if winding else 'cpu_native_parallel'
+        try:
+            return operation(mm.MeshPart(mesh), 0, params)
+        except RuntimeError as exc:
+            if params.fwn is None:
+                raise
+            report['warnings'].append(f'Ошибка CUDA; повтор на CPU с тем же шагом: {exc}')
+            params.fwn = None
+            report['compute_device'] = 'cpu_native_parallel'
+            return operation(mm.MeshPart(mesh), 0, params)
+
+    emit(f'Разреженное восстановление; шаг {settings.quality_mm:g} мм. '
+         'Остановка доступна во время расчёта.')
+    if settings.restore_sharp_edges:
+        try:
+            result = reconstruct(True)
+            check = diagnostics(result, mm)
+            if not valid(check):
+                raise RuntimeError(f"дыр {check['boundary_loops']}, пересекающихся граней {check['self_intersecting_faces']}")
+            report['sharpening']['accepted'] = True
+            emit('Восстановление острых рёбер принято после проверки топологии.')
+            return result
+        except (RuntimeError, AttributeError, TypeError) as exc:
+            report['sharpening']['reason'] = str(exc)
+            warning = f'Sharpening отклонён: {exc}. Повтор обычного воксельного восстановления с тем же шагом.'
+            report['warnings'].append(warning)
+            emit(warning)
+    return reconstruct(False)
 
 
 
@@ -264,7 +286,7 @@ def run(source, destination=None, settings=Settings(), emit=lambda message: None
     if source.suffix.lower() not in {'.stl', '.obj', '.ply'}:
         raise ValueError('Поддерживаются STL, OBJ и PLY.')
     target = Path(destination).resolve() if destination else output_path(source)
-    if target == source or target.exists() or Path(str(target)+'.json').exists():
+    if target == source or target.exists() or Path(str(target)+'.json').exists() or Path(str(target)+'.deviation.npz').exists():
         raise ValueError('Выходной файл уже существует. Исходники и результаты не перезаписываются.')
     if not target.parent.is_dir() or target.suffix.lower() != '.stl':
         raise ValueError('Нужна существующая папка и новое имя STL.')
@@ -273,7 +295,7 @@ def run(source, destination=None, settings=Settings(), emit=lambda message: None
     from .inspection import describe_mesh
     started = time.monotonic()
     tracker = Progress(progress)
-    report = {'version': '0.7.0', 'settings': asdict(settings), 'source': str(source),
+    report = {'version': '0.8.0', 'settings': asdict(settings), 'source': str(source),
               'units': 'mm', 'tolerance_certified': False, 'warnings': [], 'steps': [],
               'compute_device': 'cpu_native_parallel', 'acceleration': capabilities()}
     load_settings = mm.MeshLoadSettings()
@@ -299,6 +321,8 @@ def run(source, destination=None, settings=Settings(), emit=lambda message: None
     report['orientation'] = orientation
     report['steps'].append({'name': 'Согласование ориентации', **orientation})
     emit(f"Ориентация: несогласованных рёбер {orientation['disoriented_edges']}; фрагментов {orientation['components_before']} → {orientation['components_after']}; {orientation['elapsed_seconds']:.2f} с.")
+    if orientation.get('conflicting_faces'):
+        report['warnings'].append(f"Неориентируемых компонентов: {orientation['unoriented_components']}, граней: {orientation['conflicting_faces']}. Их ориентация пропущена; остальные компоненты обработаны.")
     if not orientation['accepted']:
         report['warnings'].append('Согласование ориентации не принято: ' + orientation.get('reason', 'unknown'))
     before, shells = describe_mesh(reference, mm, tracker.callback(12, 15, 'Диагностика исходника'))
@@ -308,37 +332,39 @@ def run(source, destination=None, settings=Settings(), emit=lambda message: None
     info = diagnostics(mesh, mm, tracker.callback(15, 18, 'Поиск оставшихся повреждений'))
     report['prepared'] = info
     emit(f"После согласования: треугольников {info['triangles']:,}; оболочек {info['components']}; дыр {info['boundary_loops']}.")
+    from .holes import fill_simple_holes
+    mesh, hole_report = fill_simple_holes(mesh, mm, settings.quality_mm,
+        tracker.callback(18, 30, 'Заполнение простых дыр'), emit)
+    report['hole_filling'] = hole_report
+    report['steps'].append({'name': 'Заполнение простых дыр', **hole_report})
+    if hole_report['holes_after']:
+        report['warnings'].append(f"После безопасного заполнения осталось дыр: {hole_report['holes_after']}. Они переданы объёмному восстановлению.")
+    info = diagnostics(mesh, mm)
+    report['after_hole_filling'] = info
     repaired = None
     t = time.monotonic()
-    if info['components'] <= 32 and info['boundary_loops'] <= 32:
-        try:
-            work = mm.Mesh(mesh)
-            tracker.update(19, 'Ремонт поверхностей')
-            for edge in list(work.topology.findHoleRepresentiveEdges()):
-                mm.fillHole(work, edge)
-            if info['components'] == 1 and not info['self_intersecting_faces']:
-                repaired = work
-                if repaired.topology.isClosed() and repaired.volume() < 0:
-                    repaired.topology.flipOrientation()
-                report['algorithm'] = 'surface_repair'
-            else:
-                repaired = union_small(work, mm, tracker)
+    if info['closed'] and not info['self_intersecting_faces']:
+        if info['components'] == 1 and valid(info):
+            repaired = mesh
+            report['algorithm'] = 'surface_repair'
+        elif info['components'] <= 32:
+            # The count limits only expensive sequential CSG, never hole filling.
+            try:
+                repaired = union_small(mesh, mm, tracker)
                 report['algorithm'] = 'solid_union'
-            if not valid(diagnostics(repaired, mm)):
+                if not valid(diagnostics(repaired, mm)):
+                    repaired = None
+            except RuntimeError as exc:
+                report['surface_attempt_error'] = str(exc)
                 repaired = None
-        except RuntimeError as exc:
-            report['surface_attempt_error'] = str(exc)
-            repaired = None
-    # Closed disjoint solids need neither union nor voxel resampling. This also
-    # preserves tiny islands in sets of >32 bodies and fixes mixed global winding.
-    elif valid(info) and info['boundary_loops'] == 0:
-        repaired = mesh
-        report['algorithm'] = 'closed_components_preserved'
+        elif valid(info):
+            repaired = mesh
+            report['algorithm'] = 'closed_components_preserved'
     if repaired is None:
         repaired = sparse_repair(mesh, mm, settings, tracker, report, emit)
-        reason = 'Поверхностного ремонта недостаточно либо слишком много открытых фрагментов/дыр.'
+        reason = 'После заполнения дыр остались открытые фрагменты или пересечения; требуется воксельное восстановление.'
     else:
-        reason = 'После согласования ориентации поверхность можно обработать без вокселей.'
+        reason = 'Ориентация и заполнение простых дыр позволили сохранить поверхность без вокселей.'
     report['algorithm_reason'] = reason
     report['steps'].append({'name': 'Восстановление поверхности', 'elapsed_seconds': time.monotonic()-t,
                             'algorithm': report['algorithm'], 'reason': reason})
@@ -380,12 +406,11 @@ def run(source, destination=None, settings=Settings(), emit=lambda message: None
         if settings.collapse_coplanar or settings.simplify_curved:
             simplify_attempts(exported, tmp, mm, settings, tracker, report, emit, folder)
         final = mm.loadMesh(tmp)
-        t = time.monotonic()
-        tracker.update(97, 'Измерение отклонения от исходника')
-        deviation = math.sqrt(mm.findMaxDistanceSqOneWay(mm.MeshPart(final), mm.MeshPart(reference)))
-        report['source_deviation'] = {'mode': 'measured_not_proven', 'direction': 'source_vertices_to_result_surface',
-            'max_deviation_mm': deviation, 'warning_threshold_mm': 2*settings.quality_mm,
-            'elapsed_seconds': time.monotonic()-t}
+        from .deviation import source_deviation
+        map_tmp = folder/'deviation.npz'
+        report['source_deviation'] = source_deviation(reference, final, mm, settings.quality_mm,
+            map_tmp, report['acceleration'], tracker.callback(96, 99, 'Карта отклонения от исходника'), emit)
+        deviation = report['source_deviation']['max_deviation_mm']
         if not math.isfinite(deviation) or deviation > 2*settings.quality_mm:
             report['warnings'].append(f'Отклонение вершин исходника от результата {deviation:.6g} мм больше двух шагов ({2*settings.quality_mm:g} мм). Проверьте потерянные детали, полости и места ремонта.')
         from .inspection import shell_summary
@@ -397,6 +422,14 @@ def run(source, destination=None, settings=Settings(), emit=lambda message: None
         report.update(status='repaired' if count == 1 else 'repaired_multiple_shells', output=str(target),
                       elapsed_seconds=time.monotonic()-started)
         publish_stl(tmp, target)
+        try:
+            if report['source_deviation'].get('heatmap_error'):
+                raise OSError(report['source_deviation']['heatmap_error'])
+            map_target = Path(str(target)+'.deviation.npz')
+            publish_stl(map_tmp, map_target)
+            report['source_deviation']['heatmap_file'] = str(map_target)
+        except OSError as exc:
+            report['warnings'].append('STL сохранён, но карту отклонения записать не удалось: '+str(exc))
         try:
             atomic_json(str(target)+'.json', report, temp_dir=folder)
         except (OSError, ValueError, TypeError) as exc:
