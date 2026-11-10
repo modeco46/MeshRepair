@@ -42,9 +42,9 @@ def main():
     api = 'https://api.github.com/repos/'+repository
     opener = urllib.request.build_opener(SafeRedirect())
 
-    def request(url, data=None, method=None, binary=False, content_type=None):
+    def request(url, data=None, method=None, binary=False, content_type=None, accept=None):
         headers = {'Authorization': 'Bearer '+os.environ['GH_TOKEN'],
-                   'Accept': 'application/octet-stream' if binary else 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'}
+                   'Accept': accept or ('application/octet-stream' if binary else 'application/vnd.github+json'), 'X-GitHub-Api-Version': '2022-11-28'}
         if data is not None and not isinstance(data, bytes):
             data = json.dumps(data).encode('utf-8')
             content_type = 'application/json'
@@ -70,6 +70,7 @@ def main():
         time.sleep(15)
     if run is None:
         raise RuntimeError('Не найдена проверенная сборка main для этого тега.')
+    create_tag = False
     if automatic:
         try:
             reference = request(api+'/git/ref/tags/'+tag)
@@ -79,17 +80,22 @@ def main():
         except urllib.error.HTTPError as exc:
             if exc.code != 404:
                 raise
-            request(api+'/git/refs', {'ref': 'refs/tags/'+tag, 'sha': sha})
+            create_tag = True
     name = 'MeshRepair-'+version+'-windows-x64'
     artifacts = request(api+'/actions/runs/'+str(run['id'])+'/artifacts')['artifacts']
     artifact = next((a for a in artifacts if a['name'] == name and not a['expired']), None)
     if artifact is None:
         raise RuntimeError('Архив EXE отсутствует или истёк; повторите сборку коммита main.')
-    payload = request(artifact['archive_download_url'], binary=True)
+    # Actions' archive endpoint requires the JSON media type for its redirect,
+    # although the signed download target returns ZIP bytes. Release *assets*
+    # instead require application/octet-stream.
+    payload = request(artifact['archive_download_url'], binary=True, accept='application/vnd.github+json')
     digest = hashlib.sha256(payload).hexdigest()
     if artifact.get('digest') and artifact['digest'] != 'sha256:'+digest:
         raise RuntimeError('Контрольная сумма архива не совпадает.')
     Path(name+'.zip').write_bytes(payload)
+    if create_tag:
+        request(api+'/git/refs', {'ref': 'refs/tags/'+tag, 'sha': sha})
     try:
         release = request(api+'/releases/tags/'+urllib.parse.quote(tag, safe=''))
     except urllib.error.HTTPError as exc:

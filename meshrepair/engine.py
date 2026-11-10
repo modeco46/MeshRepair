@@ -334,7 +334,7 @@ def run(source, destination=None, settings=Settings(), emit=lambda message: None
     from .inspection import describe_mesh
     started = time.monotonic()
     tracker = Progress(progress)
-    report = {'version': '0.8.0', 'settings': asdict(settings), 'source': str(source),
+    report = {'version': '0.8.1', 'settings': asdict(settings), 'source': str(source),
               'units': 'mm', 'tolerance_certified': False, 'warnings': [], 'steps': [],
               'compute_device': 'cpu_native_parallel', 'acceleration': capabilities()}
     load_settings = mm.MeshLoadSettings()
