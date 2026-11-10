@@ -101,4 +101,7 @@ def test_cli_output_retains_old_publication_contract(tmp_path):
                            '--temp-directory',str(tmp_path/'temp')],capture_output=True,text=True,encoding='utf-8',timeout=30)
     assert result.returncode==0,result.stderr+result.stdout
     assert all(Path(str(target)+suffix).is_file() for suffix in ('','.json','.deviation.npz'))
+    report=json.loads(Path(str(target)+'.json').read_text(encoding='utf-8'))
+    assert all(Path(path).is_file() for path in report['artifacts'].values())
+    assert 'work_directory' not in report
     assert not list((tmp_path/'temp').iterdir())

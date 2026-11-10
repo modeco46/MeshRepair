@@ -433,13 +433,18 @@ def _publish_cli(report, target):
     # Sidecar errors must not hide a successfully published STL (legacy contract).
     saved, _ = save_artifacts(report, target, {'stl': True}, no_replace=True)
     report.update(output=str(target), saved_at=saved['saved_at'])
+    published = {'stl': str(target)}
     try:
         if report['source_deviation'].get('heatmap_error'):
             raise OSError(report['source_deviation']['heatmap_error'])
         save_artifacts(report, target, {'deviation': True}, no_replace=True)
         report['source_deviation']['heatmap_file'] = str(target)+'.deviation.npz'
+        published['deviation'] = str(target)+'.deviation.npz'
     except OSError as exc:
+        report['source_deviation']['heatmap_file'] = None
         report['warnings'].append('STL сохранён, но карту отклонения записать не удалось: '+str(exc))
+    report['artifacts'] = published
+    report.pop('work_directory', None)
     try:
         atomic_json(str(target)+'.json', report)
     except (OSError, ValueError, TypeError) as exc:
