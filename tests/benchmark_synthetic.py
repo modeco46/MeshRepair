@@ -23,13 +23,19 @@ def main():
         output = Path(folder) / 'result.stl'
         mm.saveMesh(a, source)
         p = subprocess.run([sys.executable, '-m', 'meshrepair.worker', str(source), '--output', str(output),
-                            '--quality', '.001'],
+                            '--quality', '.1'],
                            capture_output=True, encoding='utf-8', timeout=180)
         if p.returncode:
             raise RuntimeError(p.stdout + p.stderr)
         report = json.loads(Path(str(output) + '.json').read_text(encoding='utf-8'))
+        # Intersections now deliberately take the voxel route. A 1-micron grid
+        # on these 20-mm spheres would benchmark enormous output allocation,
+        # not the old surface boolean. Keep the CI fixture explicitly bounded.
+        assert report['settings']['quality_mm'] == .1
+        assert report['algorithm'] == 'sparse_openvdb_winding'
+        assert report['after']['closed'] and report['after']['self_intersecting_faces'] == 0
         print(json.dumps({key: report[key] for key in ['before', 'after', 'elapsed_seconds',
-                         'algorithm', 'compute_device']}, indent=2))
+                         'algorithm', 'compute_device', 'settings', 'source_deviation']}, indent=2))
 
 
 if __name__ == '__main__':

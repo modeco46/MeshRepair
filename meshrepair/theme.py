@@ -4,13 +4,14 @@ STYLE = '''
 QMainWindow, QWidget#root { background: #0c121c; color: #e8eef7; }
 QWidget { color: #e8eef7; font-family: "Segoe UI", "DejaVu Sans"; font-size: 13px; }
 QLabel { background: transparent; }
-QLabel#brand { font-size: 26px; font-weight: 700; letter-spacing: -1px; }
-QLabel#monogram { color: #0c121c; background: #62dfbc; border-radius: 12px; font-size: 20px; font-weight: 800; }
+QLabel#brand { font-size: 20px; font-weight: 700; letter-spacing: -1px; }
+QLabel#monogram { color: #0c121c; background: #62dfbc; border-radius: 9px; font-size: 16px; font-weight: 800; }
 QLabel#subtitle, QLabel#muted { color: #93a4bb; }
 QLabel#section { color: #93a4bb; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
-QLabel#statValue { font-size: 23px; font-weight: 650; }
-QLabel#statLabel { font-size: 11px; color: #93a4bb; }
-QLabel#badge { color: #a6cbbf; background: #172c2a; border: 1px solid #2b4841; border-radius: 12px; padding: 5px 10px; }
+QLabel#statValue { font-size: 15px; font-weight: 650; }
+QLabel#statLabel { font-size: 10px; color: #93a4bb; }
+QFrame#statChip { background: #141e2c; border: 1px solid #253247; border-radius: 9px; }
+QLabel#badge { color: #a6cbbf; background: #172c2a; border: 1px solid #2b4841; border-radius: 9px; padding: 5px 8px; font-size: 11px; }
 QLabel#emptyView { color: #74889f; font-size: 17px; background: #111d2b; border-radius: 10px; }
 QFrame#card { background: #141e2c; border: 1px solid #253247; border-radius: 12px; }
 QFrame#dropCard { background: #15232f; border: 1px dashed #416473; border-radius: 12px; }

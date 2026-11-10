@@ -277,6 +277,45 @@ def simplify_attempts(exported, tmp, mm, settings, tracker, report, emit, workdi
         emit('Допуск упрощения: ' + ('подтверждён по всей поверхности.' if summary['verification'].get('verified') else 'измерен по вершинам, не доказан для всей поверхности.'))
 
 
+def cleanup_exported(exported, path, mm, settings, tracker, report, folder, emit):
+    """Accept cleanup only after the candidate survives another STL roundtrip."""
+    started = time.monotonic()
+    item = {'accepted': False, 'before': report['after']['triangles']}
+    candidate_path = folder/'cleanup.stl'
+    try:
+        candidate = mm.Mesh(exported)
+        params = mm.FixMeshDegeneraciesParams()
+        params.mode = mm.FixMeshDegeneraciesParams.Mode.Decimate
+        params.maxDeviation = settings.quality_mm*.01
+        params.tinyEdgeLength = settings.quality_mm*.001
+        params.cb = tracker.callback(78, 79, 'Проверка очистки вырожденных граней')
+        mm.fixMeshDegeneracies(candidate, params)
+        mm.saveMesh(candidate, candidate_path)
+        candidate = mm.loadMesh(candidate_path)
+        info = diagnostics(candidate, mm)
+        if not valid(info):
+            item['reason'] = 'cleanup_topology_changed'
+        elif info['components'] != report['after']['components']:
+            item['reason'] = 'cleanup_shell_count_changed'
+        else:
+            os.replace(candidate_path, path)
+            exported = candidate
+            report['after'] = info
+            item.update(accepted=True, after=info['triangles'])
+    except (RuntimeError, MemoryError) as exc:
+        item.update(reason='cleanup_native_error', detail=str(exc))
+    finally:
+        candidate_path.unlink(missing_ok=True)
+    item['elapsed_seconds'] = time.monotonic()-started
+    report['degenerate_cleanup'] = item
+    report['steps'].append({'name': 'Проверка очистки вырожденных граней', **item})
+    if not item['accepted']:
+        message = 'Очистка вырожденных граней отклонена: изменились оболочки или корректность STL. Сохранена сетка до очистки. ['+item['reason']+']'
+        emit(message)
+        report['warnings'].append(message)
+    return exported
+
+
 def run(source, destination=None, settings=Settings(), emit=lambda message: None,
         progress=lambda event: None, work_dir=None):
     settings.validate()
@@ -377,12 +416,6 @@ def run(source, destination=None, settings=Settings(), emit=lambda message: None
         raise RuntimeError(f"Результат не прошёл проверку: дыр {after['boundary_loops']}; пересечений {after['self_intersecting_faces']}. Файл не сохранён.")
     report['steps'].append({'name': 'Проверка результата', 'elapsed_seconds': time.monotonic()-t})
     emit(f"После ремонта: {info['triangles']:,} → {after['triangles']:,} треугольников; затем выполняется упрощение, если включено.")
-    if report['algorithm'] == 'sparse_openvdb_winding':
-        cleanup = mm.FixMeshDegeneraciesParams()
-        cleanup.mode = mm.FixMeshDegeneraciesParams.Mode.Decimate
-        cleanup.maxDeviation, cleanup.tinyEdgeLength = settings.quality_mm*.01, settings.quality_mm*.001
-        cleanup.cb = tracker.callback(70, 72, 'Удаление вырожденных треугольников')
-        mm.fixMeshDegeneracies(repaired, cleanup)
     repaired.transform(mm.AffineXf3f.translation(center))
     reference.transform(mm.AffineXf3f.translation(center))
     mesh = None
@@ -403,6 +436,8 @@ def run(source, destination=None, settings=Settings(), emit=lambda message: None
         if not valid(report['after']):
             raise RuntimeError('STL после сохранения не прошёл проверку.')
         report['steps'].append({'name': 'Запись и повторная проверка STL', 'elapsed_seconds': time.monotonic()-t})
+        if report['algorithm'] == 'sparse_openvdb_winding':
+            exported = cleanup_exported(exported, tmp, mm, settings, tracker, report, folder, emit)
         if settings.collapse_coplanar or settings.simplify_curved:
             simplify_attempts(exported, tmp, mm, settings, tracker, report, emit, folder)
         final = mm.loadMesh(tmp)

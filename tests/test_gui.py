@@ -27,6 +27,10 @@ def test_stop_button_terminates_native_worker(tmp_path):
     run_case('stop', tmp_path)
 
 
+def test_compact_header_and_two_column_layout(tmp_path):
+    run_case('layout', tmp_path)
+
+
 def pump(app, window, predicate=None):
     deadline = time.monotonic() + 50
     while time.monotonic() < deadline:
@@ -57,7 +61,34 @@ def exercise(name, tmp_path):
     mm.subdivideMesh(mesh, settings)
     mm.saveMesh(mesh, source)
     try:
-        if name == 'repair':
+        if name == 'layout':
+            from PySide6.QtWidgets import QLabel
+            window.hardware.setText('CPU × 8 · CUDA')
+            for key, text in [('triangles', '894 562 → 6 289 696'), ('components', '1 150 → 89'), ('closed', 'Нет → Да')]:
+                window.stat_labels[key].setText(text)
+            for width, height in [(980, 680), (1280, 880), (1920, 1080)]:
+                window.resize(width, height)
+                app.processEvents()
+                assert window.header.height() <= 50
+                assert window.check_button.text() == 'Проверить'
+                assert not any('Проверка, восстановление и оптимизация' in item.text() for item in window.findChildren(QLabel))
+                assert window.viewport.width() == window.workspace.width()
+                assert window.viewport.height() > window.tabs.height()*2
+                assert window.sidebar.geometry().right() < window.workspace.geometry().left()
+                assert window.header.geometry().bottom() < window.workspace.geometry().top()
+                if width >= 1280:
+                    fraction = window.sidebar.width()/(window.sidebar.width()+window.workspace.width())
+                    assert .20 <= fraction <= .26
+                    for value in window.stat_labels.values():
+                        assert value.fontMetrics().horizontalAdvance(value.text()) <= value.width()
+                for chip in window.stat_chips:
+                    assert window.header.rect().contains(chip.geometry())
+                for a, b in zip(window.stat_chips, window.stat_chips[1:]):
+                    assert a.geometry().right() < b.geometry().left()
+                # No clipped input/spin arrows inside the sidebar scroll viewport.
+                assert window.quality.mapTo(window.sidebar, QPoint(window.quality.width(), 0)).x() <= window.sidebar.width()
+                assert window.sharp.mapTo(window.sidebar, QPoint(window.sharp.width(), 0)).x() <= window.sidebar.width()
+        elif name == 'repair':
             window.set_source(source)
             pump(app, window)
             assert window.view.data.GetNumberOfCells() == mesh.topology.numValidFaces()

@@ -13,7 +13,7 @@ def report_html(report):
         return '—' if v is None else (f'{v:.6g}' if isinstance(v, float) else f'{v:,}'.replace(',', ' ') if isinstance(v, int) else str(v))
     before = report.get('before', report.get('info', {}))
     if not before:
-        return '<p>Нажмите «Check / Проверить» или «Исправить сетку».</p>'
+        return '<p>Нажмите «Проверить» или «Исправить сетку».</p>'
     section('Исходник')
     for title, key in [('Треугольников', 'triangles'), ('Связных фрагментов после загрузки', 'components'),
                        ('Граней в крупнейшем', 'largest_component_triangles'), ('Мелких частей (<50 граней)', 'small_components'),

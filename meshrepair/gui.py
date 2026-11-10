@@ -295,7 +295,7 @@ class App(QMainWindow, LayoutMixin):
                 self.write(f'Загрузчик пропустил непригодные грани: {skipped}.')
             duplicated = report.get('loader', {}).get('duplicated_vertices', 0)
             if duplicated:
-                self.write(f'При загрузке разделены вершины: {duplicated}. Число связных частей может включать перевёрнутые фрагменты. Подробности — Check.')
+                self.write(f'При загрузке разделены вершины: {duplicated}. Число связных частей может включать перевёрнутые фрагменты. Подробности — кнопка «Проверить».')
             self.status.setText('85% · Загрузка геометрии в 3D-окно…')
             self.progress.setValue(85)
             heatmap = (self.last_repair_report or {}).get('source_deviation', {}).get('heatmap_file')
@@ -389,7 +389,7 @@ class App(QMainWindow, LayoutMixin):
             if 'closed_components' in info:
                 lines.append(f"Замкнутых оболочек: {info['closed_components']} · Открытых: {info['open_components']}")
         else:
-            lines.append('Для полной диагностики нажмите «Check / Проверить».')
+            lines.append('Для полной диагностики нажмите «Проверить».')
         self.detail_text.setText('\n'.join(lines))
 
     def write_inspection(self, report):

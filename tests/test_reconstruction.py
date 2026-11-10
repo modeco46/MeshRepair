@@ -258,3 +258,20 @@ def test_sharpening_preserves_closed_wedge_crease():
     assert info['triangles']<=1000
     assert max_distance_to(ideal,sample_surface(candidate))<=.002
     assert max_distance_to(candidate,sample_surface(subdivide(ideal,.35)))<=.002
+
+
+def test_degenerate_cleanup_cannot_break_valid_stl(tmp_path, monkeypatch):
+    from meshrepair.engine import cleanup_exported, Progress
+    mesh = mm.makeCube()
+    path = tmp_path/'result.stl'
+    mm.saveMesh(mesh, path)
+    original = path.read_bytes()
+    report = {'after': diagnostics(mesh, mm), 'warnings': [], 'steps': []}
+    def broken_cleanup(candidate, params):
+        candidate.topology.deleteFace(mm.FaceId(0))
+    monkeypatch.setattr(mm, 'fixMeshDegeneracies', broken_cleanup)
+    result = cleanup_exported(mesh, path, mm, Settings(.05), Progress(lambda _: None), report, tmp_path, lambda _: None)
+    assert result.topology.isClosed()
+    assert path.read_bytes() == original
+    assert not report['degenerate_cleanup']['accepted']
+    assert report['degenerate_cleanup']['reason'] == 'cleanup_topology_changed'

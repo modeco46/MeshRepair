@@ -1,9 +1,9 @@
 """Qt layout and lightweight model for shell diagnostics."""
-from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QLocale
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QLocale, QSize
+from PySide6.QtGui import QColor, QFont, QPainter
 from PySide6.QtWidgets import (QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QFrame, QDoubleSpinBox, QCheckBox, QProgressBar, QPlainTextEdit, QSplitter,
-    QTabWidget, QTableView, QHeaderView, QScrollArea)
+    QTabWidget, QTableView, QHeaderView, QScrollArea, QSizePolicy)
 from .viewer import MeshView
 
 
@@ -83,37 +83,78 @@ class DecimalBox(QDoubleSpinBox):
         return super().valueFromText(self.normalized(text))
 
 
+class StatValue(QLabel):
+    """Keep full values in text/tooltip while fitting a single compact header."""
+    def __init__(self):
+        super().__init__('—')
+        self.setObjectName('statValue')
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+
+    def minimumSizeHint(self):
+        return QSize(24, super().minimumSizeHint().height())
+
+    def setText(self, text):
+        super().setText(text)
+        self.setToolTip(text)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setPen(self.palette().windowText().color())
+        painter.setFont(self.font())
+        text = self.fontMetrics().elidedText(self.text(), Qt.ElideMiddle, self.contentsRect().width())
+        painter.drawText(self.contentsRect(), Qt.AlignLeft | Qt.AlignVCenter, text)
+
+
 class LayoutMixin:
     def setup_ui(self, preview_enabled):
         root = QWidget()
         root.setObjectName('root')
         self.setCentralWidget(root)
         outer = QVBoxLayout(root)
-        outer.setContentsMargins(22, 18, 22, 18)
-        outer.setSpacing(14)
-        header = QHBoxLayout()
+        outer.setContentsMargins(12, 6, 12, 10)
+        outer.setSpacing(8)
+        self.header = QWidget()
+        self.header.setObjectName('header')
+        self.header.setFixedHeight(46)
+        header = QHBoxLayout(self.header)
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(8)
         monogram = label('MR', 'monogram')
-        monogram.setFixedSize(48, 48)
+        monogram.setFixedSize(32, 32)
         monogram.setAlignment(Qt.AlignCenter)
         header.addWidget(monogram)
-        brand = QVBoxLayout()
-        brand.setSpacing(1)
-        brand.addWidget(label('MeshRepair', 'brand'))
-        brand.addWidget(label('Проверка, восстановление и оптимизация сеток', 'subtitle'))
-        header.addLayout(brand)
-        header.addStretch()
+        header.addWidget(label('MeshRepair', 'brand'))
+        header.addSpacing(8)
+        self.stat_labels = {}
+        self.stat_chips = []
+        for key, title in [('triangles', 'ТРЕУГОЛЬНИКИ'), ('components', 'СВЯЗНЫЕ ЧАСТИ'), ('closed', 'ЗАМКНУТОСТЬ')]:
+            frame = QFrame()
+            frame.setObjectName('statChip')
+            frame.setFixedHeight(34)
+            row = QHBoxLayout(frame)
+            row.setContentsMargins(10, 0, 10, 0)
+            row.setSpacing(7)
+            value = StatValue()
+            if key == 'closed':
+                value.setMinimumWidth(90)
+            row.addWidget(value, 1)
+            row.addWidget(label(title, 'statLabel'))
+            if key == 'components':
+                frame.setToolTip('Связные части после загрузки. Перевёрнутые грани могут отделяться загрузчиком; это не число физических тел. Кнопка «Проверить» покажет эффект согласования.')
+            self.stat_labels[key] = value
+            self.stat_chips.append(frame)
+            header.addWidget(frame, 3 if key == 'triangles' else 2)
         self.hardware = label('CPU / CUDA · авто', 'badge')
         header.addWidget(self.hardware)
         header.addWidget(label('0.8', 'muted'))
-        outer.addLayout(header)
+        outer.addWidget(self.header)
 
         body = QHBoxLayout()
-        body.setSpacing(16)
+        body.setSpacing(12)
         left = QVBoxLayout()
         left.setSpacing(12)
         sidebar = QWidget()
         sidebar.setLayout(left)
-        sidebar.setFixedWidth(300)
         left.setContentsMargins(0, 0, 0, 0)
         drop, layout = card('dropCard')
         layout.addWidget(label('01  ИСХОДНЫЙ ФАЙЛ', 'section'))
@@ -173,12 +214,12 @@ class LayoutMixin:
         layout.addWidget(label('Допуск упрощения отсчитывается\nот уже исправленной поверхности.', 'muted', True))
         left.addWidget(settings)
         footer = QVBoxLayout()
-        footer.setContentsMargins(0, 0, 16, 0)
+        footer.setContentsMargins(0, 0, 0, 0)
         footer.setSpacing(10)
         self.repair = button('Исправить сетку', lambda: self.start('repair'), 'primary')
         footer.addWidget(self.repair)
         actions = QHBoxLayout()
-        self.check_button = button('Check / Проверить', lambda: self.start('check'))
+        self.check_button = button('Проверить', lambda: self.start('check'))
         self.stop_button = button('Остановить', self.cancel, 'danger')
         actions.addWidget(self.check_button)
         actions.addWidget(self.stop_button)
@@ -189,30 +230,28 @@ class LayoutMixin:
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setFixedWidth(316)
         scroll.setWidget(sidebar)
         scroll.setStyleSheet('QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }')
-        side_column = QVBoxLayout()
+        self.sidebar = QWidget()
+        # Keep spinbox arrows and all checkbox labels inside the scroll area
+        # even at the supported minimum window width.
+        self.sidebar.setMinimumWidth(292)
+        side_column = QVBoxLayout(self.sidebar)
+        side_column.setContentsMargins(0, 0, 0, 0)
+        side_column.setSpacing(10)
         side_column.addWidget(scroll, 1)
         side_column.addLayout(footer)
-        body.addLayout(side_column)
+        body.addWidget(self.sidebar, 1)
 
-        right = QVBoxLayout()
-        right.setSpacing(12)
-        stats = QHBoxLayout()
-        self.stat_labels = {}
-        for key, title in [('triangles', 'ТРЕУГОЛЬНИКИ'), ('components', 'СВЯЗНЫЕ ЧАСТИ'), ('closed', 'ЗАМКНУТОСТЬ')]:
-            frame, layout = card(margins=12)
-            value = label('—', 'statValue')
-            layout.addWidget(value)
-            layout.addWidget(label(title, 'statLabel'))
-            if key == 'components':
-                frame.setToolTip('Связные части топологии после загрузки. Перевёрнутые грани могут отделяться загрузчиком; это не число физических тел. Check покажет эффект согласования.')
-            self.stat_labels[key] = value
-            stats.addWidget(frame)
-        right.addLayout(stats)
+        self.workspace = QWidget()
+        right = QVBoxLayout(self.workspace)
+        right.setContentsMargins(0, 0, 0, 0)
+        right.setSpacing(0)
         split = QSplitter(Qt.Vertical)
+        self.workspace_split = split
+        split.setChildrenCollapsible(False)
         viewport, layout = card(margins=10)
+        self.viewport = viewport
         toolbar = QHBoxLayout()
         self.source_button = button('Исходник', lambda: self.show_source(False))
         self.result_button = button('Результат', lambda: self.show_source(True))
@@ -239,6 +278,7 @@ class LayoutMixin:
         layout.addWidget(self.view, 1)
         foot = QHBoxLayout()
         self.render_label = label('ЛКМ: вращение · СКМ: сдвиг · колесо: масштаб', 'muted')
+        self.render_label.setWordWrap(True)
         self.render_label.setStyleSheet('font-size: 11px;')
         foot.addWidget(self.render_label, 1)
         for title, view in [('Вписать', None), ('Изо', 'iso'), ('Сверху', 'top'), ('Спереди', 'front')]:
@@ -271,7 +311,7 @@ class LayoutMixin:
         self.tabs.addTab(log_panel, 'Журнал')
         details = QWidget()
         details_layout = QVBoxLayout(details)
-        self.detail_text = label('Нажмите «Check / Проверить» для подробной диагностики.', 'muted', True)
+        self.detail_text = label('Нажмите «Проверить» для подробной диагностики.', 'muted', True)
         details_layout.addWidget(self.detail_text)
         self.shell_model = ShellModel()
         self.shell_table = QTableView()
@@ -285,15 +325,16 @@ class LayoutMixin:
         self.report_view = QTextBrowser()
         self.report_view.setOpenExternalLinks(False)
         self.report_view.setStyleSheet('QTextBrowser { background: #101b29; color: #dce8f0; border: 1px solid #293a50; border-radius: 8px; padding: 10px; }')
-        self.report_view.setHtml('<p>Нажмите Check или Исправить для отчёта.</p>')
+        self.report_view.setHtml('<p>Нажмите «Проверить» или «Исправить сетку» для отчёта.</p>')
         self.tabs.addTab(self.report_view, 'Отчёт')
         bottom_layout.addWidget(self.tabs)
         split.addWidget(bottom)
-        split.setSizes([450, 220])
+        bottom.setMinimumHeight(140)
+        split.setSizes([600, 190])
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 1)
         right.addWidget(split, 1)
-        body.addLayout(right, 1)
+        body.addWidget(self.workspace, 3)
         outer.addLayout(body, 1)
         status_row = QHBoxLayout()
         self.status = label('Выберите или перетащите файл.', 'muted')
