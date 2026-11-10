@@ -34,6 +34,8 @@ jobs:
         if: runner.os == 'Linux'
         run: xvfb-run -a python tests/check_viewport.py
       - run: python tests/benchmark_synthetic.py
+      - name: Measure 0.9 checks before and after (CPU)
+        run: python tests/benchmark_090.py --real tests/data/test.stl --one-cpu --json benchmark-090.json
   windows:
     defaults:
       run:
@@ -58,6 +60,6 @@ jobs:
           copy THIRD_PARTY.md dist\MeshRepair\THIRD_PARTY.md
       - uses: actions/upload-artifact@v4
         with:
-          name: MeshRepair-0.8.1-windows-x64
+          name: MeshRepair-0.9.0-windows-x64
           path: dist/MeshRepair/
           retention-days: 30

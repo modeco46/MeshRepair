@@ -3,6 +3,36 @@ import time
 import numpy as np
 
 
+def patch_collisions(before, candidate, patch, mm):
+    """Check changed faces and their spatial neighbours, including moved rim faces.
+
+    The region contains every triangle whose box overlaps the box of the edits.
+    Thus any new intersection has both operands in the region. Using the SDK's
+    self-collision query preserves its handling of shared edges/vertices.
+    """
+    from meshlib import mrmeshnumpy as mn
+    old_v, new_v = mn.getNumpyVerts(before), mn.getNumpyVerts(candidate)
+    old_f, new_f = mn.getNumpyFaces(before.topology), mn.getNumpyFaces(candidate.topology)
+    changed_v = np.ones(len(new_v), dtype=bool)
+    n = min(len(old_v), len(new_v))
+    changed_v[:n] = np.any(old_v[:n] != new_v[:n], axis=1)
+    changed_f = np.ones(len(new_f), dtype=bool)
+    n = min(len(old_f), len(new_f))
+    changed_f[:n] = np.any(old_f[:n] != new_f[:n], axis=1)
+    changed_f |= np.any(changed_v[new_f], axis=1)
+    affected = (mn.faceBitSetFromBools(changed_f) | patch) & candidate.topology.getValidFaces()
+    ids = np.fromiter((int(f) for f in affected), dtype=np.int32, count=affected.count())
+    if not len(ids):
+        return mm.FaceBitSet()
+    points = new_v[new_f[ids]]
+    lo, hi = points.min(axis=(0, 1)), points.max(axis=(0, 1))
+    margin = max(1., float(np.abs(points).max())) * np.finfo(np.float32).eps * 8
+    tri = new_v[new_f]
+    nearby = np.all(tri.max(axis=1) >= lo-margin, axis=1) & np.all(tri.min(axis=1) <= hi+margin, axis=1)
+    region = mn.faceBitSetFromBools(nearby) & candidate.topology.getValidFaces()
+    return mm.findSelfCollidingTrianglesBS(mm.MeshPart(candidate, region)) & affected
+
+
 def planar_boundary(mesh, mm, loop, points, quality_mm):
     # A planar boundary alone is insufficient (a latitude hole on a sphere).
     # Require support from at least one coplanar neighboring face as well.
@@ -35,8 +65,6 @@ def fill_simple_holes(mesh, mm, quality_mm, progress=lambda value: None, emit=la
               'max_diameter_mm': max_diameter_mm, 'max_boundary_edges': max_boundary_edges,
               'max_patch_faces': max_patch_faces, 'time_budget_seconds': time_budget_seconds,
               'details': []}
-    if loops:
-        existing_collisions = mm.findSelfCollidingTrianglesBS(mm.MeshPart(work))
     target_edge = max(2*quality_mm, .05)
     for index, edge in enumerate(loops):
         progress(index/max(1, len(loops)))
@@ -80,17 +108,15 @@ def fill_simple_holes(mesh, mm, quality_mm, progress=lambda value: None, emit=la
             settings.smoothCurvature = True
             patch = mm.fillHoleNicely(candidate, edge, settings)
             remaining = candidate.topology.findNumHoles()
-            collisions = mm.findSelfCollidingTrianglesBS(mm.MeshPart(candidate))
             if (not patch.count() or remaining >= before_holes or not candidate.topology.checkValidity()
                     or not np.isfinite(mn.getNumpyVerts(candidate)).all()):
                 item['reason'] = 'patch_not_closed'
-            elif (collisions-existing_collisions).count():
+            elif patch_collisions(work, candidate, patch, mm).count():
                 item['reason'] = 'patch_self_intersections'
             elif patch.count() > max_patch_faces:
                 item['reason'] = 'patch_work_limit'
             else:
                 work = candidate
-                existing_collisions = collisions
                 item.update(accepted=True, patch_triangles=patch.count())
                 report['filled'] += before_holes-remaining
         except RuntimeError as exc:

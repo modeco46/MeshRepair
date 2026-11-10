@@ -32,7 +32,7 @@ def test_valid_quality(quality):
 def test_valid_large_mesh_no_voxel_budget(tmp_path):
     source = save(tmp_path, cube(40))
     original = source.read_bytes()
-    report = run(source, settings=Settings(.001))
+    report = run(source, source.with_name("input_repaired.stl"), settings=Settings(.001))
     assert report['after']['triangles'] == 12
     assert report['after']['closed']
     assert report['algorithm'] == 'surface_repair'
@@ -46,10 +46,10 @@ def test_no_overwrite_and_auto_names(tmp_path):
     source = save(tmp_path, cube())
     with pytest.raises(ValueError):
         run(source, source)
-    first = run(source)
+    first = run(source, output_path(source))
     data = Path(first['output']).read_bytes()
     assert output_path(source).name == 'input_repaired_1.stl'
-    second = run(source)
+    second = run(source, output_path(source))
     assert second['output'] != first['output']
     assert Path(first['output']).read_bytes() == data
 

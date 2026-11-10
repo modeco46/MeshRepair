@@ -129,6 +129,9 @@ def exercise(name, tmp_path):
             assert window.shell_model.columnCount() == 6
             assert not list(tmp_path.glob('.meshrepair-*'))
             assert window.result_path.is_file()
+            assert set(tmp_path.iterdir()) == {source}
+            assert window.save_button.isEnabled()
+            assert window.unsaved_result
             assert not window.angle.isEnabled()
             window.curved.click()
             assert window.angle.isEnabled()
@@ -185,6 +188,7 @@ def exercise(name, tmp_path):
             assert not (tmp_path/'.meshrepair-owned-test').exists()
             assert unrelated.is_dir()
     finally:
+        window.unsaved_result = False
         window.close()
         app.processEvents()
 

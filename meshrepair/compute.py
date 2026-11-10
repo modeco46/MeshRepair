@@ -22,10 +22,11 @@ def cuda_module():
     return None
 
 
-def capabilities():
+def capabilities(disable_cuda=False):
     result = {'cpu_threads': cpu_count(), 'cuda_available': False,
               'topology_backend': 'cpu_native_parallel', 'decimation_backend': 'cpu_native_parallel'}
-    cuda = cuda_module()
+    result['cuda_disabled'] = disable_cuda
+    cuda = None if disable_cuda else cuda_module()
     if cuda is not None:
         info = cuda.getDeviceInfo()
         result.update(cuda_available=True, gpu_name=info.name,
@@ -39,7 +40,7 @@ class Projector:
         self.mesh, self.mm, self.report, self.emit = mesh, mm, report, emit
         self.native = None
         self.gpu = False
-        cuda = cuda_module()
+        cuda = None if report and report.get('cuda_disabled') else cuda_module()
         if cuda is not None:
             try:
                 self.native = cuda.PointsToMeshProjector()

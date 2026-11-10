@@ -21,7 +21,7 @@ def dense(path):
 @pytest.mark.parametrize('reason', ['verification_work_limit','distance_not_confirmed','projection_failed'])
 def test_uncertain_proof_measured_fallback(tmp_path, monkeypatch, reason):
     path=tmp_path/'cube.stl';dense(path)
-    monkeypatch.setattr(reduction, 'verify_surface_bound', lambda *a, **k: {'verified':False,'reason':reason})
+    monkeypatch.setattr(reduction, 'verify_surface_bound', lambda *a, **k: pytest.fail('Measured mode must not run proof'))
     report=run(path,settings=Settings(.02,True))
     result=report['simplification']
     assert result['accepted']
@@ -39,7 +39,7 @@ def test_strict_rejection_attempts_and_visible_reason(tmp_path,monkeypatch):
     assert not result['accepted']
     assert 'Исходник → после ремонта → после упрощения' in report_html(report)
     assert result['input_triangles'] == report['before']['triangles']
-    assert [x['max_error_mm'] for x in result['attempts']]==[.02,.01,.005]
+    assert [x['max_error_mm'] for x in result['attempts']]==[.005,.0025,.00125]
     assert 'verification_work_limit' in report_html(report)
     assert Path(report['output']).exists()
 
@@ -48,7 +48,7 @@ def test_actual_violation_never_uses_measured_fallback(tmp_path,monkeypatch):
     path=tmp_path/'cube.stl';dense(path)
     monkeypatch.setattr(reduction,'verify_surface_bound', lambda *a,**k: {'verified':False,'reason':'sample_exceeds_tolerance'})
     monkeypatch.setattr(reduction,'measured_distance', lambda *a: pytest.fail('Actual violation must not be ignored'))
-    report=run(path,settings=Settings(.02,True))
+    report=run(path,settings=Settings(.02,True,strict_tolerance=True))
     assert not report['simplification']['accepted']
 
 
@@ -96,6 +96,6 @@ def test_sidecar_failure_keeps_valid_stl(tmp_path,monkeypatch):
     source=tmp_path/'cube.stl';dense(source)
     def fail(*args, **kwargs): raise OSError('read-only report')
     monkeypatch.setattr(engine,'atomic_json',fail)
-    result=run(source)
+    result=run(source,source.with_name('result.stl'))
     assert Path(result['output']).exists()
     assert any('JSON' in w for w in result['warnings'])

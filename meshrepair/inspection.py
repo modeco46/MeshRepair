@@ -53,6 +53,8 @@ def shell_summary(mesh, mm):
     largest = int(np.argmax(sizes))
     shells = [{'id': int(i)+1, 'triangles': int(sizes[i]), 'closed': bool(open_edges[i] == 0),
                'boundary_edges': int(open_edges[i]), 'bbox_mm': (maximum[i]-minimum[i]).tolist(),
+               'bbox_min_mm': minimum[i].tolist(), 'bbox_max_mm': maximum[i].tolist(),
+               'center_mm': ((minimum[i]+maximum[i])*.5).tolist(),
                'kind': 'основное тело' if i == largest else ('мелкий остров' if sizes[i] < 50 else 'оболочка')}
               for i in order]
     info = {'boundary_edges': int(open_edges.sum()), 'closed_components': int(np.count_nonzero(open_edges == 0)),
@@ -103,6 +105,8 @@ def export_preview(source, destination, progress=lambda event: None):
     source, mesh, mm, loader = load(source, tracker)
     tracker.update(35, 'Подготовка предпросмотра')
     info = basic_info(mesh, mm)
+    from .storage import check_space
+    check_space(Path(destination).parent, info['triangles'])
     center = mesh.computeBoundingBox().center()
     # Translation only; keep every triangle and do not simplify the displayed mesh.
     mesh.transform(mm.AffineXf3f.translation(-center))

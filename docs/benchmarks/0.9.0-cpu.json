@@ -1,0 +1,326 @@
+{
+  "compute_device": "cpu_native_parallel",
+  "checks": {
+    "200_holes_global_vs_local": {
+      "before_seconds": 21.99218195999947,
+      "after_seconds": 19.855776947999402,
+      "saved_seconds": 2.1364050120000684,
+      "input_triangles": 48952,
+      "holes": 200
+    },
+    "prepared_diagnostics_vs_topology": {
+      "before_seconds": 0.4811370409997835,
+      "after_seconds": 0.038694759999998496,
+      "saved_seconds": 0.442442280999785
+    },
+    "duplicate_repair_validation_vs_cached": {
+      "before_seconds": 0.329806097999608,
+      "after_seconds": 1.2959999367012642e-06,
+      "saved_seconds": 0.3298048019996713
+    },
+    "cleanup_before_simplify_vs_skip": {
+      "before_seconds": 0.7852147779994993,
+      "after_seconds": 1.1290003385511227e-06,
+      "saved_seconds": 0.7852136489991608
+    },
+    "cleanup_roundtrip_vs_memory": {
+      "before_seconds": 0.7369530980004129,
+      "after_seconds": 0.5327914139998029,
+      "saved_seconds": 0.20416168400060997
+    },
+    "candidate_roundtrip_vs_memory": {
+      "before_seconds": 0.11636268500024016,
+      "after_seconds": 0.08036385300056281,
+      "saved_seconds": 0.03599883199967735
+    },
+    "strict_proof_vs_measured": {
+      "before_seconds": 2.725682940000297,
+      "after_seconds": 0.21662922200084722,
+      "saved_seconds": 2.50905371799945
+    },
+    "extra_final_load_vs_reuse": {
+      "before_seconds": 0.01999342599992815,
+      "after_seconds": 1.2519994925241917e-06,
+      "saved_seconds": 0.019992174000435625
+    },
+    "full_sharp_validation_vs_common_final_only": {
+      "before_seconds": 0.3563886590000038,
+      "after_seconds": 1.374000021314714e-06,
+      "saved_seconds": 0.3563872849999825
+    },
+    "rejected_full_sharp_vs_probe": {
+      "before_seconds": 9.366839119999895,
+      "after_seconds": 0.33627395599978627,
+      "saved_seconds": 9.030565164000109,
+      "full_intersections": 18163,
+      "probe_intersections": 1853
+    }
+  },
+  "dense_triangles": 335584,
+  "voxel_seconds": 9.415604077000353,
+  "environment": {
+    "os": "Linux",
+    "cpu_affinity": 1,
+    "cuda": false,
+    "meshlib": "3.1.4.297",
+    "date": "2026-11-10",
+    "note": "Other validation processes could run concurrently; timings are illustrative."
+  },
+  "end_to_end": {
+    "0.8.1": {
+      "algorithm": "sparse_openvdb_winding",
+      "elapsed_seconds": 269.59747648000007,
+      "compute_device": "cpu_native_parallel",
+      "settings": {
+        "quality_mm": 0.02,
+        "collapse_coplanar": true,
+        "coplanar_angle_deg": 5,
+        "simplify_curved": true,
+        "strict_tolerance": false,
+        "weld_close_vertices": false,
+        "restore_sharp_edges": true
+      },
+      "after": {
+        "vertices": 58930,
+        "triangles": 117848,
+        "closed": true,
+        "topology_valid": true,
+        "boundary_loops": 0,
+        "components": 3,
+        "self_intersecting_faces": 0,
+        "signed_volume_mm3": 367.04321738819993,
+        "boundary_edges": 0,
+        "closed_components": 3,
+        "open_components": 0,
+        "small_components": 2,
+        "largest_component_triangles": 117824
+      },
+      "source_deviation": {
+        "max_deviation_mm": 0.10672804713249207,
+        "exceeding_vertices": 39,
+        "top10": [
+          {
+            "vertex_id": 45571,
+            "coordinates_mm": [
+              3.080134868621826,
+              3.0911617279052734,
+              3.148012638092041
+            ],
+            "deviation_mm": 0.10672804713249207
+          },
+          {
+            "vertex_id": 45549,
+            "coordinates_mm": [
+              3.0763514041900635,
+              3.1664485931396484,
+              3.1828126907348633
+            ],
+            "deviation_mm": 0.09261316806077957
+          },
+          {
+            "vertex_id": 45550,
+            "coordinates_mm": [
+              3.074084758758545,
+              3.133408546447754,
+              3.181819438934326
+            ],
+            "deviation_mm": 0.0908438041806221
+          },
+          {
+            "vertex_id": 45570,
+            "coordinates_mm": [
+              3.0932164192199707,
+              3.1334238052368164,
+              3.1564908027648926
+            ],
+            "deviation_mm": 0.08024410158395767
+          },
+          {
+            "vertex_id": 45575,
+            "coordinates_mm": [
+              3.1867289543151855,
+              3.043489933013916,
+              3.2171502113342285
+            ],
+            "deviation_mm": 0.07754097878932953
+          },
+          {
+            "vertex_id": 45574,
+            "coordinates_mm": [
+              3.1946358680725098,
+              3.043428897857666,
+              3.194636821746826
+            ],
+            "deviation_mm": 0.07669372111558914
+          },
+          {
+            "vertex_id": 45551,
+            "coordinates_mm": [
+              3.095104694366455,
+              3.134730815887451,
+              3.2002978324890137
+            ],
+            "deviation_mm": 0.0692453533411026
+          },
+          {
+            "vertex_id": 45545,
+            "coordinates_mm": [
+              3.1001031398773193,
+              3.1349525451660156,
+              3.1924195289611816
+            ],
+            "deviation_mm": 0.06397695094347
+          },
+          {
+            "vertex_id": 45572,
+            "coordinates_mm": [
+              3.117588520050049,
+              3.092308521270752,
+              3.199998378753662
+            ],
+            "deviation_mm": 0.06212681904435158
+          },
+          {
+            "vertex_id": 45548,
+            "coordinates_mm": [
+              3.1245999336242676,
+              3.171571731567383,
+              3.208193302154541
+            ],
+            "deviation_mm": 0.05327868461608887
+          }
+        ]
+      }
+    },
+    "0.9.0": {
+      "algorithm": "local_cut_and_fill",
+      "elapsed_seconds": 8.449992101000134,
+      "compute_device": "cpu_native_parallel",
+      "settings": {
+        "quality_mm": 0.02,
+        "collapse_coplanar": true,
+        "coplanar_angle_deg": 5,
+        "simplify_curved": true,
+        "strict_tolerance": false,
+        "weld_close_vertices": false,
+        "restore_sharp_edges": true,
+        "local_fix_max_faces": 200,
+        "local_fix_fraction": 0.001,
+        "remove_small_shells": false,
+        "disable_cuda": true,
+        "temp_directory": ""
+      },
+      "after": {
+        "vertices": 18477,
+        "triangles": 36946,
+        "closed": true,
+        "topology_valid": true,
+        "boundary_loops": 0,
+        "components": 2,
+        "signed_volume_mm3": 367.05398426795665,
+        "self_intersecting_faces": 0,
+        "boundary_edges": 0,
+        "closed_components": 2,
+        "open_components": 0,
+        "small_components": 1,
+        "largest_component_triangles": 36936
+      },
+      "source_deviation": {
+        "max_deviation_mm": 0.09100791066884995,
+        "exceeding_vertices": 16,
+        "top10": [
+          {
+            "vertex_id": 45566,
+            "coordinates_mm": [
+              3.157783031463623,
+              3.199380874633789,
+              3.198376417160034
+            ],
+            "deviation_mm": 0.09100791066884995
+          },
+          {
+            "vertex_id": 92453,
+            "coordinates_mm": [
+              3.094127893447876,
+              3.234522581100464,
+              3.2135164737701416
+            ],
+            "deviation_mm": 0.08738004416227341
+          },
+          {
+            "vertex_id": 45574,
+            "coordinates_mm": [
+              3.1946358680725098,
+              3.043428897857666,
+              3.194636821746826
+            ],
+            "deviation_mm": 0.08500995486974716
+          },
+          {
+            "vertex_id": 45577,
+            "coordinates_mm": [
+              3.2343554496765137,
+              3.094655990600586,
+              3.237102746963501
+            ],
+            "deviation_mm": 0.07577433437108994
+          },
+          {
+            "vertex_id": 30892,
+            "coordinates_mm": [
+              3.094233751296997,
+              3.2283482551574707,
+              3.228347063064575
+            ],
+            "deviation_mm": 0.07492650300264359
+          },
+          {
+            "vertex_id": 45540,
+            "coordinates_mm": [
+              3.1528384685516357,
+              3.200329065322876,
+              3.214855432510376
+            ],
+            "deviation_mm": 0.07436365634202957
+          },
+          {
+            "vertex_id": 45578,
+            "coordinates_mm": [
+              3.2368080615997314,
+              3.0946435928344727,
+              3.2143073081970215
+            ],
+            "deviation_mm": 0.07404514402151108
+          },
+          {
+            "vertex_id": 92479,
+            "coordinates_mm": [
+              3.2377336025238037,
+              3.0942366123199463,
+              3.2184665203094482
+            ],
+            "deviation_mm": 0.07360778003931046
+          },
+          {
+            "vertex_id": 45575,
+            "coordinates_mm": [
+              3.1867289543151855,
+              3.043489694595337,
+              3.2171499729156494
+            ],
+            "deviation_mm": 0.07084669917821884
+          },
+          {
+            "vertex_id": 45573,
+            "coordinates_mm": [
+              3.181314468383789,
+              3.092989683151245,
+              3.1813151836395264
+            ],
+            "deviation_mm": 0.06819973886013031
+          }
+        ]
+      }
+    }
+  }
+}

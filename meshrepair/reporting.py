@@ -35,6 +35,7 @@ def report_html(report):
     if report.get('steps'):
         section('Шаги ремонта')
         names = {'surface_repair': 'Поверхностный ремонт', 'solid_union': 'Булево объединение',
+                 'local_cut_and_fill': 'Локальный ремонт CutAndFill',
                  'closed_components_preserved': 'Сохранение замкнутых тел', 'sparse_openvdb_winding': 'Воксельное восстановление'}
         for step in report['steps']:
             line('✓ '+step['name']+': '+fmt(step.get('elapsed_seconds'))+' с')
@@ -48,6 +49,23 @@ def report_html(report):
     sharp = report.get('sharpening')
     if sharp:
         line('Восстановление острых рёбер: '+('принято' if sharp.get('accepted') else 'отклонено' if sharp.get('requested') else 'выключено'), '' if sharp.get('accepted') else 'warning')
+        if sharp.get('reason'):
+            line('Проба с шагом ×4: '+sharp['reason'], 'warning')
+    local = report.get('local_repair', {})
+    if local.get('attempted'):
+        section('Локальный ремонт')
+        line('CutAndFill: '+('принят' if local.get('accepted') else 'отклонён'))
+        line(f"Самопересекающиеся грани: {local['before']['self_intersecting_faces']} → {local.get('after', {}).get('self_intersecting_faces', '—')}")
+        for shell in local.get('shells', []):
+            xyz = ', '.join(fmt(v) for v in shell['center_mm'])
+            line(f"Оболочка {shell['id']}: {shell['triangles']} граней; центр bbox ({xyz}) мм.")
+        deviation = local.get('source_deviation', {})
+        if deviation.get('top10'):
+            line(f"После CutAndFill: максимум {fmt(deviation['max_deviation_mm'])} мм; "
+                 f"вершин > {fmt(deviation['warning_threshold_mm'])} мм: {deviation['exceeding_vertices']}.")
+            line('Наихудшая точка исходника: '+', '.join(fmt(v) for v in deviation['top10'][0]['coordinates_mm'])+' мм.')
+    for shell in report.get('removed_shells', []):
+        line(f"Удалена мелкая оболочка: {shell['triangles']} граней, центр {shell['center_mm']} мм.", 'warning')
     after = report.get('after')
     if after:
         section('Результат')
@@ -71,7 +89,7 @@ def report_html(report):
         percent = 100*(1-reduction['after']/max(1, reduction['before']))
         line(f"{'✓ Принято' if accepted else '✗ Отклонено'}: {reduction['before']:,} → {reduction['after']:,} (−{percent:.1f}%)", '' if accepted else 'bad')
         verification = reduction.get('verification', {})
-        mode = verification.get('mode')
+        mode = verification.get('mode', reduction.get('mode'))
         if mode:
             line('Проверка: '+ ('доказано численным ограничением всей поверхности' if mode == 'proven' else 'измерено по вершинам в обе стороны; не доказано'), '' if mode == 'proven' else 'warning')
             line('Отклонение от исправленной сетки: '+fmt(verification.get('max_deviation_mm'))+' мм')
