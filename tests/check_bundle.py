@@ -49,7 +49,7 @@ if __name__ == '__main__':
         target = Path(folder) / 'simplified.stl'
         p = subprocess.run([executable, '--worker', str(source), '--output', str(target),
                             '--quality', '.02', '--collapse-coplanar', '--coplanar-angle', '1',
-                            '--simplify-curved'], capture_output=True, encoding='utf-8',
+                            '--simplify-curved', '--strict-tolerance'], capture_output=True, encoding='utf-8',
                            errors='replace', timeout=180)
         print(p.stdout)
         print(p.stderr)
@@ -82,6 +82,9 @@ if __name__ == '__main__':
         assert report['after']['closed']
         assert report['algorithm'] == 'surface_repair'
         assert report['simplification']['accepted']
+
+        from meshrepair.storage import remove_job
+        remove_job(report['work_directory'])
 
         damaged = mm.Mesh()
         for i in range(40):

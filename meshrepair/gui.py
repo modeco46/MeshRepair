@@ -3,13 +3,13 @@ import json
 import os
 from pathlib import Path
 import sys
-import tempfile
-import shutil
 import time
 from PySide6.QtCore import QTimer, QProcess, QProcessEnvironment, QSettings
 from PySide6.QtGui import QKeySequence, QShortcut
-from PySide6.QtWidgets import QApplication, QMainWindow, QFileDialog
-from .engine import Settings
+from PySide6.QtWidgets import QApplication, QMainWindow, QFileDialog, QMessageBox, QDialog
+from .engine import Settings, output_path
+from .storage import create_job, remove_job, cleanup_stale, save_artifacts, save_paths
+from .saving import SaveDialog
 from .theme import STYLE
 from .viewer import PreviewLoader
 from .widgets import LayoutMixin
@@ -19,7 +19,7 @@ from .reporting import report_html
 class App(QMainWindow, LayoutMixin):
     def __init__(self, *, preview_enabled=True, persist=True):
         super().__init__()
-        self.setWindowTitle('MeshRepair 0.8.1')
+        self.setWindowTitle('MeshRepair 0.9.0')
         self.setMinimumSize(980, 680)
         screen = QApplication.primaryScreen().availableGeometry()
         self.resize(min(1280, screen.width() - 60), min(880, screen.height() - 70))
@@ -32,7 +32,11 @@ class App(QMainWindow, LayoutMixin):
         self.operation = None
         self.reports = {}
         self.last_repair_report = self.last_check_report = None
-        self.temp = tempfile.TemporaryDirectory(prefix='meshrepair-preview-')
+        self.result_directory = None
+        self.unsaved_result = False
+        self.last_saved_path = None
+        self.legacy_cleaned = set()
+        cleanup_stale()
         self.raw_output = b''
         self.job_result = None
         self.job_directory = self.job_result_file = None
@@ -42,6 +46,7 @@ class App(QMainWindow, LayoutMixin):
         self.clock.setInterval(250)
         self.clock.timeout.connect(self.update_clock)
         QShortcut(QKeySequence.Open, self, activated=self.pick_source)
+        QShortcut(QKeySequence.Save, self, activated=self.save_result)
         if self.preferences:
             self.quality.setValue(float(self.preferences.value('quality', .02)))
             self.angle.setValue(float(self.preferences.value('angle', 1)))
@@ -50,6 +55,11 @@ class App(QMainWindow, LayoutMixin):
             self.strict.setChecked(self.preferences.value('strict', False, type=bool))
             self.weld_close.setChecked(self.preferences.value('weld_close', False, type=bool))
             self.sharp.setChecked(self.preferences.value('sharp', True, type=bool))
+            for key, widget in [('remove_small', self.remove_small), ('no_cuda', self.no_cuda), ('autosave', self.autosave)]:
+                widget.setChecked(self.preferences.value(key, False, type=bool))
+            self.temp_folder.setText(self.preferences.value('temp_folder', '', type=str))
+        if self.temp_folder.text().strip():
+            cleanup_stale(self.temp_folder.text().strip())
         self.set_busy(False)
 
     def update_reduction_controls(self):
@@ -110,6 +120,16 @@ class App(QMainWindow, LayoutMixin):
         if not path.is_file() or path.suffix.lower() not in {'.stl', '.obj', '.ply'}:
             self.write('Поддерживаются существующие STL, OBJ и PLY.')
             return
+        if not self.confirm_unsaved():
+            return
+        self.cleanup_job()
+        remove_job(self.result_directory)
+        self.result_directory = None
+        self.unsaved_result = False
+        self.last_saved_path = None
+        if path.parent not in self.legacy_cleaned:
+            cleanup_stale(path.parent, legacy=True)
+            self.legacy_cleaned.add(path.parent)
         self.source_path = self.view_path = path
         self.result_path = None
         self.reports.clear()
@@ -143,9 +163,10 @@ class App(QMainWindow, LayoutMixin):
 
     def set_busy(self, busy):
         self.is_busy = busy
-        for w in (self.browse, self.quality, self.planar, self.curved, self.strict, self.weld_close, self.sharp):
+        for w in (self.browse, self.quality, self.planar, self.curved, self.strict, self.weld_close, self.sharp, self.remove_small, self.no_cuda, self.autosave, self.temp_folder):
             w.setEnabled(not busy)
         self.update_reduction_controls()
+        self.save_button.setEnabled(not busy and self.result_path is not None)
         self.repair.setEnabled(not busy and self.source_path is not None)
         self.check_button.setEnabled(not busy and self.view_path is not None)
         self.source_button.setEnabled(not busy and self.source_path is not None)
@@ -156,17 +177,29 @@ class App(QMainWindow, LayoutMixin):
     def start(self, operation):
         if self.is_busy or self.source_path is None:
             return
+        if operation == 'repair' and not self.confirm_unsaved():
+            return
         path = self.source_path if operation == 'repair' else self.view_path
-        settings = Settings(self.quality.value(), self.planar.isChecked(), self.angle.value(), self.curved.isChecked(), self.strict.isChecked(), self.weld_close.isChecked(), self.sharp.isChecked())
+        settings = Settings(self.quality.value(), self.planar.isChecked(), self.angle.value(), self.curved.isChecked(), self.strict.isChecked(), self.weld_close.isChecked(), self.sharp.isChecked(),
+                            remove_small_shells=self.remove_small.isChecked(), disable_cuda=self.no_cuda.isChecked(),
+                            temp_directory=self.temp_folder.text().strip())
         settings.validate()
         command = ['--worker'] if getattr(sys, 'frozen', False) else ['-u', '-m', 'meshrepair.worker']
-        self.job_directory = Path(tempfile.mkdtemp(prefix='.meshrepair-', dir=path.parent if operation == 'repair' else self.temp.name))
+        # Preview/check jobs are short-lived; the repair job survives until save/close.
+        self.cleanup_job()
+        triangles = self.reports.get(str(path), {}).get('info', {}).get('triangles', 0)
+        try:
+            self.job_directory = create_job(settings.temp_directory, triangles)
+        except (OSError, ValueError) as exc:
+            self.write(str(exc))
+            self.status.setText('Не удалось создать временную папку.')
+            return
         self.job_result_file = self.job_directory / 'worker-result.json'
         command += [str(path), '--result-file', str(self.job_result_file), '--work-dir', str(self.job_directory)]
         if operation == 'check':
             command += ['--check']
         elif operation == 'preview':
-            command += ['--preview-output', str(Path(self.temp.name) / 'view.npz')]
+            command += ['--preview-output', str(self.job_directory / 'view.npz')]
         else:
             command += ['--quality', str(settings.quality_mm)]
             if settings.collapse_coplanar:
@@ -177,6 +210,10 @@ class App(QMainWindow, LayoutMixin):
                 command += ['--strict-tolerance']
             if settings.weld_close_vertices:
                 command += ['--weld-close-vertices']
+            if settings.remove_small_shells:
+                command += ['--remove-small-shells']
+            if settings.disable_cuda:
+                command += ['--no-cuda']
             if not settings.restore_sharp_edges:
                 command += ['--no-restore-sharp-edges']
         self.operation = operation
@@ -184,7 +221,9 @@ class App(QMainWindow, LayoutMixin):
         self.raw_output = b''
         self.job_result = None
         self.job_error = self.stopping = False
-        self.started = time.monotonic()
+        self.started = self.last_progress_at = self.stage_started = time.monotonic()
+        self.last_stage = ''
+        self.last_heartbeat = 0
         self.progress.setValue(0)
         self.status.setText({'preview': 'Подготовка предпросмотра…', 'check': 'Проверка сетки…', 'repair': 'Исправление сетки…'}[operation])
         if operation != 'preview':
@@ -234,6 +273,11 @@ class App(QMainWindow, LayoutMixin):
         kind, value = event['type'], event.get('value')
         if kind == 'progress' and not self.stopping:
             percent = int(value['percent'] * (.8 if self.operation == 'preview' else 1))
+            now = time.monotonic()
+            if value['stage'] != self.last_stage:
+                self.stage_started = now
+                self.last_stage = value['stage']
+            self.last_progress_at = now
             self.progress.setValue(percent)
             self.status.setText(f"{percent}% · {value['stage']}")
         elif kind == 'log':
@@ -263,16 +307,18 @@ class App(QMainWindow, LayoutMixin):
             except (ValueError, OSError, KeyError) as exc:
                 self.job_error = True
                 self.write('Не удалось прочитать отчёт рабочего процесса: '+str(exc))
-        self.cleanup_job()
         self.process.deleteLater()
         self.process = None
         if self.closing:
+            self.cleanup_job()
             return
         if self.stopping:
+            self.cleanup_job()
             self.finish_ui('Остановлено пользователем.')
             self.write('Остановлено. Исходный файл не изменён.')
             return
         if code or self.job_error or self.job_result is None:
+            self.cleanup_job()
             self.finish_ui('Операция не завершена. Подробности в журнале.')
             if not self.job_error:
                 self.write(f'Рабочий процесс завершился без результата (код {code}).')
@@ -308,6 +354,7 @@ class App(QMainWindow, LayoutMixin):
         self.progress.setValue(100)
         self.finish_ui('Готово.')
         if self.operation == 'check':
+            self.cleanup_job()
             self.last_check_report = report
             self.report_view.setHtml(report_html(report))
             self.tabs.setCurrentWidget(self.report_view)
@@ -316,6 +363,10 @@ class App(QMainWindow, LayoutMixin):
             self.write_inspection(report)
             self.status.setText('Проверка завершена. Файл не изменён.')
         else:
+            remove_job(self.result_directory)
+            self.result_directory = self.job_directory
+            self.job_directory = self.job_result_file = None
+            self.unsaved_result = True
             self.last_repair_report = report
             self.report_view.setHtml(report_html(report))
             self.tabs.setCurrentWidget(self.report_view)
@@ -325,7 +376,10 @@ class App(QMainWindow, LayoutMixin):
             self.write(f"Результат: {self.result_path}\nТреугольников: {info['triangles']:,}; оболочек: {info['components']}; дыр: {info['boundary_loops']}; пересекающихся граней: {info['self_intersecting_faces']}.")
             for warning in report['warnings']:
                 self.write(warning)
-            self.write(f"Время ремонта: {report['elapsed_seconds']:.1f} с. JSON-отчёт сохранён рядом с STL.")
+            self.write(f"Время ремонта: {report['elapsed_seconds']:.1f} с. Результат во временной папке; нажмите «Сохранить…».")
+            self.save_button.setEnabled(True)
+            if self.autosave.isChecked():
+                self.save_to(output_path(self.source_path), {'stl': True})
             self.result_button.setEnabled(True)
             QTimer.singleShot(0, lambda: self.show_source(True) if not self.closing else None)
 
@@ -349,6 +403,7 @@ class App(QMainWindow, LayoutMixin):
             self.status.setText(message)
 
     def loader_finished(self):
+        self.cleanup_job()
         if self.loader:
             self.loader.deleteLater()
             self.loader = None
@@ -364,6 +419,11 @@ class App(QMainWindow, LayoutMixin):
     def update_clock(self):
         seconds = int(time.monotonic() - self.started)
         self.elapsed.setText(f'{seconds // 60}:{seconds % 60:02d}')
+        now = time.monotonic()
+        if self.process and not self.stopping and now-self.last_progress_at >= 5 and now-self.last_heartbeat >= 5:
+            self.last_heartbeat = now
+            self.status.setText(f'{self.progress.value()}% · {self.last_stage or "Обработка"}: '
+                                f'идёт {int(now-self.stage_started)} с, этап без процентов')
 
     def update_info(self, report):
         info = report.get('info', {})
@@ -396,9 +456,62 @@ class App(QMainWindow, LayoutMixin):
         info = report['info']
         self.write(f"Проверка завершена: {info['triangles']:,} треугольников; {info['components']} связных частей; дыр {info['boundary_loops']}; пересекающихся граней {info['self_intersecting_faces']}. Подробности — вкладка «Отчёт».")
 
+    def save_result(self):
+        if self.result_path is None or self.is_busy:
+            return False
+        default = self.last_saved_path or self.source_path.with_name(self.source_path.stem+'_repaired.stl')
+        dialog = SaveDialog(default, self)
+        if dialog.exec() != QDialog.Accepted:
+            return False
+        return self.save_to(dialog.path.text(), dialog.selection())
+
+    def save_to(self, path, selected):
+        paths = save_paths(path, selected)
+        existing = [str(p) for p in paths.values() if p.exists()]
+        overwrite = False
+        if existing:
+            answer = QMessageBox.question(self, 'Подтверждение перезаписи',
+                'Перезаписать следующие файлы?\n'+'\n'.join(existing),
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                return False
+            overwrite = True
+        try:
+            saved, sizes = save_artifacts(self.last_repair_report, path, selected,
+                                          self.log.toPlainText(), overwrite=overwrite)
+        except (OSError, ValueError, KeyError) as exc:
+            QMessageBox.warning(self, 'Не удалось сохранить результат', str(exc))
+            return False
+        self.last_saved_path = Path(path).resolve()
+        self.last_repair_report.update(saved_at=saved['saved_at'], saved_files=saved['saved_files'],
+                                       saved_output=saved['output'])
+        # A JSON/log alone does not preserve the repaired geometry on exit.
+        if selected.get('stl'):
+            self.unsaved_result = False
+        for filename, size in sizes.items():
+            self.write(f'Сохранено: {filename} ({size:,} байт)')
+        self.status.setText(f'Сохранено: {self.last_saved_path}; {sum(sizes.values()):,} байт.')
+        return True
+
+    def confirm_unsaved(self):
+        if not self.unsaved_result:
+            return True
+        box = QMessageBox(self)
+        box.setWindowTitle('Несохранённый результат')
+        box.setText('Результат ремонта ещё не сохранён. Сохранить его перед продолжением?')
+        box.setStandardButtons(QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel)
+        box.setDefaultButton(QMessageBox.Save)
+        for key, text in [(QMessageBox.Save, 'Сохранить…'), (QMessageBox.Discard, 'Не сохранять'), (QMessageBox.Cancel, 'Отмена')]:
+            box.button(key).setText(text)
+        # During another operation saving is unavailable; Cancel keeps the window.
+        box.button(QMessageBox.Save).setEnabled(not self.is_busy)
+        answer = box.exec()
+        if answer == QMessageBox.Save:
+            return self.save_result() and not self.unsaved_result
+        return answer == QMessageBox.Discard
+
     def cleanup_job(self):
-        if self.job_directory:
-            shutil.rmtree(self.job_directory, ignore_errors=True)
+        remove_job(self.job_directory)
         self.job_directory = self.job_result_file = None
 
     def cancel(self):
@@ -413,20 +526,26 @@ class App(QMainWindow, LayoutMixin):
             self.loader.requestInterruption()
 
     def closeEvent(self, event):
+        if not self.confirm_unsaved():
+            event.ignore()
+            return
         self.closing = True
         self.cancel()
         if self.process:
             self.process.waitForFinished(5000)
-        self.cleanup_job()
         if self.loader:
             self.loader.wait()
+        self.cleanup_job()
         if self.preferences:
             for key, value in [('quality', self.quality.value()), ('angle', self.angle.value()),
                                ('planar', self.planar.isChecked()), ('curved', self.curved.isChecked()),
-                               ('strict', self.strict.isChecked()), ('weld_close', self.weld_close.isChecked()), ('sharp', self.sharp.isChecked())]:
+                               ('strict', self.strict.isChecked()), ('weld_close', self.weld_close.isChecked()), ('sharp', self.sharp.isChecked()),
+                               ('remove_small', self.remove_small.isChecked()), ('no_cuda', self.no_cuda.isChecked()),
+                               ('autosave', self.autosave.isChecked()), ('temp_folder', self.temp_folder.text().strip())]:
                 self.preferences.setValue(key, value)
         self.view.shutdown()
-        self.temp.cleanup()
+        remove_job(self.result_directory)
+        self.result_directory = None
         event.accept()
 
 

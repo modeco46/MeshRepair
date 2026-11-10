@@ -135,7 +135,7 @@ def test_exported_simplification_verified_against_repaired_surface(tmp_path):
     source = tmp_path / 'cube.stl'
     mesh = dense_cube()
     mm.saveMesh(mesh, source)
-    result = run(source, settings=Settings(.02, True, 1, True))
+    result = run(source, source.with_name('result.stl'), settings=Settings(.02, True, 1, True, True))
     reduction = result['simplification']
     assert reduction['accepted']
     assert reduction['after'] < reduction['before']
@@ -153,7 +153,7 @@ def test_verification_failure_rolls_back_without_losing_repair(tmp_path, monkeyp
     mesh = dense_cube()
     mm.saveMesh(mesh, source)
     monkeypatch.setattr(reduction, 'verify_surface_bound', lambda *a, **kw: {'verified': False, 'reason': 'test_uncertainty'})
-    result = run(source, settings=Settings(.02, True))
+    result = run(source, settings=Settings(.02, True, strict_tolerance=True))
     assert not result['simplification']['accepted']
     assert result['after']['triangles'] == mesh.topology.numValidFaces()
     assert Path(result['output']).is_file()

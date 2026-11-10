@@ -6,7 +6,6 @@ import math
 import os
 import tempfile
 import time
-import shutil
 import numpy as np
 from .compute import capabilities, cuda_module
 
@@ -20,25 +19,42 @@ class Settings:
     strict_tolerance: bool = False
     weld_close_vertices: bool = False
     restore_sharp_edges: bool = True
+    local_fix_max_faces: int = 200
+    local_fix_fraction: float = .001
+    remove_small_shells: bool = False
+    disable_cuda: bool = False
+    temp_directory: str = ''
 
     def validate(self):
         if not math.isfinite(self.quality_mm) or not .001 <= self.quality_mm <= .5:
             raise ValueError("Качество должно быть от 0,001 до 0,5 мм.")
         if not math.isfinite(self.coplanar_angle_deg) or not 0 <= self.coplanar_angle_deg <= 45:
             raise ValueError("Угол копланарности должен быть от 0 до 45 градусов.")
+        if self.local_fix_max_faces < 0 or not math.isfinite(self.local_fix_fraction) or not 0 <= self.local_fix_fraction <= 1:
+            raise ValueError('Некорректный порог локального ремонта.')
 
 
 class Progress:
     """Monotonic stage-weighted progress, driven by actual SDK callbacks."""
-    def __init__(self, emit):
+    def __init__(self, emit, log=None, timings=None, device=None):
         self.emit = emit
         self.percent = 0
         self.last_time = 0
         self.stage = ""
+        self.stage_started = time.monotonic()
+        self.log, self.timings, self.device = log, timings, device
 
     def update(self, percent, stage):
         percent = max(self.percent, min(100, int(percent)))
         now = time.monotonic()
+        if stage != self.stage:
+            if self.stage and self.timings is not None:
+                item = {'name': self.stage, 'elapsed_seconds': now-self.stage_started,
+                        'compute_device': self.device(self.stage) if self.device else 'cpu_native_parallel'}
+                self.timings.append(item)
+                if self.log:
+                    self.log(f"{item['name']}: {item['elapsed_seconds']:.2f} с; compute_device={item['compute_device']}.")
+            self.stage_started = now
         if stage != self.stage or percent == 100 or (percent > self.percent and now - self.last_time >= .1):
             self.percent, self.stage, self.last_time = percent, stage, now
             self.emit({"percent": percent, "stage": stage})
@@ -70,19 +86,23 @@ def output_path(source):
     raise ValueError("В папке слишком много результатов с одинаковым именем.")
 
 
-def diagnostics(mesh, mm, callback=None):
-    part = mm.MeshPart(mesh)
-    collisions = mm.findSelfCollidingTrianglesBS(part, callback) if callback else mm.findSelfCollidingTrianglesBS(part)
+def topology_info(mesh, mm):
+    """Cheap routing counters; deliberately no self-collision search."""
     return {
         "vertices": mesh.topology.numValidVerts(),
         "triangles": mesh.topology.numValidFaces(),
         "closed": mesh.topology.isClosed(),
         "topology_valid": mesh.topology.checkValidity(),
         "boundary_loops": mesh.topology.findNumHoles(),
-        "components": mm.MeshComponents.getNumComponents(part),
-        "self_intersecting_faces": collisions.count(),
+        "components": mm.MeshComponents.getNumComponents(mm.MeshPart(mesh)),
         "signed_volume_mm3": mesh.volume(),
     }
+
+
+def diagnostics(mesh, mm, callback=None):
+    part = mm.MeshPart(mesh)
+    collisions = mm.findSelfCollidingTrianglesBS(part, callback) if callback else mm.findSelfCollidingTrianglesBS(part)
+    return dict(topology_info(mesh, mm), self_intersecting_faces=collisions.count())
 
 
 def valid(info):
@@ -100,9 +120,8 @@ def union_small(mesh, mm, tracker):
             raise RuntimeError("Открытая оболочка требует объёмного восстановления.")
         if part.volume() < 0:
             part.topology.flipOrientation()
-        # Self-intersections within one operand are not valid CSG input.
-        if mm.findSelfCollidingTrianglesBS(mm.MeshPart(part)).count():
-            raise RuntimeError("Самопересечения внутри оболочки требуют восстановления.")
+        # The caller's post-hole diagnostic already excluded intersections in
+        # every operand. Rechecking each component repeats that complete search.
         if result is None:
             result = part
         else:
@@ -117,62 +136,122 @@ def union_small(mesh, mm, tracker):
 
 
 def sparse_repair(mesh, mm, settings, tracker, report, emit):
-    """OpenVDB narrow band, NOT a dense bounding-box lattice.
-
-    No fixed component/grid-count limit; selected resolution is never silently reduced.
-    Zero offset uses signed winding. CUDA is optional and may fall back to native CPU.
-    """
-    report["algorithm"] = "sparse_openvdb_winding"
-    report["voxel_size_mm"] = settings.quality_mm
+    """A coarse Sharpening probe, then ONE reconstruction at requested resolution."""
     from .orientation import orient_closed_components
+    report.update(algorithm='sparse_openvdb_winding', voxel_size_mm=settings.quality_mm)
     report['sparse_closed_orientation_corrections'] = orient_closed_components(mesh, mm)
-    report['sharpening'] = {'requested': settings.restore_sharp_edges, 'accepted': False}
+    sharp = report['sharpening'] = {'requested': settings.restore_sharp_edges, 'accepted': False}
     report['compute_device'] = 'cpu_native_parallel'
+    estimate = max(1, int(mesh.area()/settings.quality_mm**2))
+    report['voxel_estimate'] = {'triangles': estimate, 'method': 'area_over_step_squared'}
+    emit(f'Оценка воксельной поверхности: ≈ {estimate:,} треугольников (площадь / шаг²); '
+         'время зависит от CPU, CUDA и формы. На одном CPU для 2 млн граней — порядка 3 минут.')
     winding = None
     try:
-        cuda = cuda_module()
+        cuda = None if settings.disable_cuda else cuda_module()
         if cuda is not None:
             winding = cuda.FastWindingNumber(mesh)
     except Exception as exc:
         report['warnings'].append(f'CUDA недоступна, используется CPU: {exc}')
+    report['voxel_passes'] = []
 
-    def reconstruct(sharp):
-        params = mm.GeneralOffsetParameters() if sharp else mm.OffsetParameters()
-        params.voxelSize = settings.quality_mm
+    def reconstruct(sharpen, step, probe=False):
+        nonlocal winding
+        params = mm.GeneralOffsetParameters() if sharpen else mm.OffsetParameters()
+        params.voxelSize = step
         params.signDetectionMode = mm.SignDetectionMode.HoleWindingRule
-        params.callBack = tracker.callback(42, 65, 'Восстановление острых рёбер' if sharp else 'Восстановление поверхности')
+        stage = 'Проба острых рёбер (шаг ×4)' if probe else 'Восстановление поверхности'
+        params.callBack = tracker.callback(32 if probe else 42, 41 if probe else 65, stage)
         params.fwn = winding
-        if sharp:
+        if sharpen:
             params.mode = mm.GeneralOffsetParametersMode.Sharpening
-        operation = mm.generalOffsetMesh if sharp else mm.offsetMesh
-        report['compute_device'] = 'cuda_winding_with_cpu_openvdb' if winding else 'cpu_native_parallel'
+        operation = mm.generalOffsetMesh if sharpen else mm.offsetMesh
+        device = 'cuda_winding_with_cpu_openvdb' if winding is not None else 'cpu_native_parallel'
+        report['compute_device'] = device
+        item = {'probe': probe, 'sharpening': sharpen, 'voxel_size_mm': step, 'compute_device': device}
+        report['voxel_passes'].append(item)
+        started = time.monotonic()
+        emit(f'{stage}: шаг {step:g} мм; compute_device={device}.')
         try:
-            return operation(mm.MeshPart(mesh), 0, params)
-        except RuntimeError as exc:
-            if params.fwn is None:
-                raise
-            report['warnings'].append(f'Ошибка CUDA; повтор на CPU с тем же шагом: {exc}')
-            params.fwn = None
-            report['compute_device'] = 'cpu_native_parallel'
-            return operation(mm.MeshPart(mesh), 0, params)
+            try:
+                return operation(mm.MeshPart(mesh), 0, params)
+            except RuntimeError as exc:
+                if params.fwn is None:
+                    raise
+                report['warnings'].append(f'Ошибка CUDA; повтор на CPU с тем же шагом: {exc}')
+                winding = params.fwn = None
+                report['compute_device'] = item['fallback_device'] = 'cpu_native_parallel'
+                emit('Повтор после ошибки CUDA: compute_device=cpu_native_parallel.')
+                return operation(mm.MeshPart(mesh), 0, params)
+        finally:
+            item['elapsed_seconds'] = time.monotonic()-started
+            emit(f"{stage}: {item['elapsed_seconds']:.2f} с; compute_device={report['compute_device']}.")
 
-    emit(f'Разреженное восстановление; шаг {settings.quality_mm:g} мм. '
-         'Остановка доступна во время расчёта.')
+    use_sharp = False
     if settings.restore_sharp_edges:
         try:
-            result = reconstruct(True)
-            check = diagnostics(result, mm)
+            probe = reconstruct(True, settings.quality_mm*4, probe=True)
+            check = diagnostics(probe, mm)
+            sharp['probe_initial'] = check
+            # A few coarse-grid seam intersections need not disable a useful
+            # sharp reconstruction. Repair only the small, closed probe and
+            # validate it; noisy probes with many intersections are rejected.
+            threshold = max(settings.local_fix_max_faces, int(check['triangles']*settings.local_fix_fraction))
+            if check['closed'] and check['topology_valid'] and 0 < check['self_intersecting_faces'] <= threshold:
+                params = mm.FixSelfIntersectionSettings()
+                params.method = mm.FixSelfIntersectionMethod.CutAndFill
+                mm.SelfIntersections.fix(probe, params)
+                probe.pack()
+                check = diagnostics(probe, mm)
+                sharp['probe_local_fix'] = True
+            sharp['probe'] = check
             if not valid(check):
                 raise RuntimeError(f"дыр {check['boundary_loops']}, пересекающихся граней {check['self_intersecting_faces']}")
-            report['sharpening']['accepted'] = True
-            emit('Восстановление острых рёбер принято после проверки топологии.')
-            return result
+            use_sharp = True
+            emit('Грубая проба Sharpening прошла проверку.')
         except (RuntimeError, AttributeError, TypeError) as exc:
-            report['sharpening']['reason'] = str(exc)
-            warning = f'Sharpening отклонён: {exc}. Повтор обычного воксельного восстановления с тем же шагом.'
+            sharp['reason'] = str(exc)
+            warning = f'Sharpening отклонён на грубой пробе: {exc}. Полный расчёт — обычные воксели.'
             report['warnings'].append(warning)
             emit(warning)
-    return reconstruct(False)
+    result = reconstruct(use_sharp, settings.quality_mm)
+    # The common final in-memory validation checks the full-resolution mesh once.
+    # Do not repeat a full offset if Sharpening fails that validation.
+    sharp['accepted'] = use_sharp
+    return result
+
+
+def local_repair(mesh, info, mm, settings, tracker, report, emit):
+    threshold = max(settings.local_fix_max_faces, int(info['triangles']*settings.local_fix_fraction))
+    item = report['local_repair'] = {'threshold_faces': threshold, 'attempted': False, 'accepted': False}
+    if not 0 < info['self_intersecting_faces'] <= threshold:
+        return None, None
+    tracker.update(31, 'Локальное устранение самопересечений')
+    started = time.monotonic()
+    item.update(attempted=True, before=info)
+    try:
+        candidate = mm.Mesh(mesh)
+        params = mm.FixSelfIntersectionSettings()
+        params.method = mm.FixSelfIntersectionMethod.CutAndFill
+        mm.SelfIntersections.fix(candidate, params)
+        candidate.pack()
+        after = diagnostics(candidate, mm)
+        item['after'] = after
+        if valid(after):
+            item['accepted'] = True
+            from .inspection import shell_summary
+            _, item['shells'] = shell_summary(candidate, mm)
+            return candidate, after
+        item['reason'] = 'local_fix_invalid'
+    except (RuntimeError, MemoryError) as exc:
+        item.update(reason='local_fix_failed', detail=str(exc))
+    finally:
+        item['elapsed_seconds'] = time.monotonic()-started
+        report['steps'].append({'name': 'Локальное устранение самопересечений', **item})
+        emit(f"CutAndFill: {'принят' if item['accepted'] else 'отклонён'}; "
+             f"{info['self_intersecting_faces']} → {item.get('after', {}).get('self_intersecting_faces', '—')}; "
+             f"{item['elapsed_seconds']:.2f} с; compute_device=cpu_native_parallel.")
+    return None, None
 
 
 
@@ -197,75 +276,113 @@ def publish_stl(source, target):
         os.link(source, target)
 
 
+def cleanup_exported(exported, path, mm, settings, tracker, report, folder, emit):
+    """Compatibility name; cleanup and validation now stay entirely in memory."""
+    started = time.monotonic()
+    item = {'accepted': False, 'before': report['after']['triangles']}
+    try:
+        candidate = mm.Mesh(exported)
+        params = mm.FixMeshDegeneraciesParams()
+        params.mode = mm.FixMeshDegeneraciesParams.Mode.Decimate
+        params.maxDeviation = settings.quality_mm*.01
+        params.tinyEdgeLength = settings.quality_mm*.001
+        params.cb = tracker.callback(78, 79, 'Очистка вырожденных граней')
+        mm.fixMeshDegeneracies(candidate, params)
+        candidate.invalidateCaches()
+        candidate.pack()
+        info = diagnostics(candidate, mm)
+        if not valid(info):
+            item['reason'] = 'cleanup_topology_changed'
+        elif info['components'] != report['after']['components']:
+            item['reason'] = 'cleanup_shell_count_changed'
+        else:
+            exported = candidate
+            report['after'] = info
+            item.update(accepted=True, after=info['triangles'])
+    except (RuntimeError, MemoryError) as exc:
+        item.update(reason='cleanup_native_error', detail=str(exc))
+    item['elapsed_seconds'] = time.monotonic()-started
+    report['degenerate_cleanup'] = item
+    report['steps'].append({'name': 'Очистка вырожденных граней', **item})
+    emit(f"Очистка: {item['elapsed_seconds']:.2f} с; compute_device=cpu_native_parallel.")
+    if not item['accepted']:
+        message = 'Очистка вырожденных граней отклонена. Сохранена сетка до очистки. ['+item['reason']+']'
+        emit(message)
+        report['warnings'].append(message)
+    return exported
+
+
 def simplify_attempts(exported, tmp, mm, settings, tracker, report, emit, workdir):
+    """Validate small candidates in memory; return the accepted mesh or original."""
     from . import reduction as rd
     original = report['after']
+    mode = 'proven' if settings.strict_tolerance else 'measured_not_proven'
     summary = {'requested': True, 'accepted': False, 'before': original['triangles'],
                'after': original['triangles'], 'tolerance_mm': settings.quality_mm,
-               'strict_tolerance': settings.strict_tolerance, 'input_triangles': report.get('before', {}).get('triangles'), 'attempts': []}
+               'strict_tolerance': settings.strict_tolerance, 'mode': mode,
+               'input_triangles': report.get('before', {}).get('triangles'), 'attempts': []}
     report['simplification'] = summary
+    emit('Режим допуска: '+('доказано (строгая проверка).' if settings.strict_tolerance else 'измерено (вершины в обе стороны).'))
     started = time.monotonic()
-    for attempt, factor in enumerate((1., .5, .25), 1):
-        item = {'attempt': attempt, 'max_error_mm': settings.quality_mm*factor}
+    factor = .25
+    accepted = exported
+    for attempt in range(1, 4):
+        item = {'attempt': attempt, 'error_scale': factor, 'max_error_mm': settings.quality_mm*factor}
         summary['attempts'].append(item)
         t = time.monotonic()
-        candidate_tmp = Path(workdir) / f'reduction-{attempt}.stl'
         try:
-            proposal, stages = rd.propose_reduction(exported, mm, settings, tracker, error_scale=factor)
-            item['stages'] = stages
-            summary['stages'] = stages
-            if proposal.topology.numValidFaces() >= original['triangles']:
+            candidate, stages = rd.propose_reduction(exported, mm, settings, tracker, error_scale=factor)
+            item['stages'] = summary['stages'] = stages
+            if candidate.topology.numValidFaces() >= original['triangles']:
                 item['reason'] = 'no_reducible_edges'
                 break
-            mm.saveMesh(proposal, candidate_tmp)
-            del proposal
-            candidate = mm.loadMesh(candidate_tmp)
             candidate_info = diagnostics(candidate, mm, tracker.callback(86, 88, 'Проверка упрощённой сетки'))
+            if not valid(candidate_info) and mm.findDegenerateFaces(mm.MeshPart(candidate)).count():
+                cleanup_report = {'after': candidate_info, 'steps': [], 'warnings': []}
+                candidate = cleanup_exported(candidate, None, mm, settings, tracker, cleanup_report, None, emit)
+                candidate_info = cleanup_report['after']
+                item['cleanup'] = cleanup_report['degenerate_cleanup']
             item['candidate'] = candidate_info
             if not valid(candidate_info):
                 item['reason'] = 'topology_changed'
             elif candidate_info['components'] != original['components']:
                 item['reason'] = 'kept_shell_count_changed'
             else:
-                try:
+                if settings.strict_tolerance:
                     verification = rd.verify_surface_bound(exported, candidate, settings.quality_mm,
-                        tracker.callback(88, 96, f'Проверка допуска: попытка {attempt}/3'),
-                        # In measured mode don't spend unbounded time proving a
-                        # result which can be explicitly accepted as sampled.
-                        max_checks=None if settings.strict_tolerance else max(100000, 2*(original['triangles']+candidate_info['triangles'])),
+                        tracker.callback(88, 96, f'Строгая проверка допуска: {attempt}/3'),
                         acceleration=report['acceleration'], emit=emit)
-                except RuntimeError as exc:
-                    verification = {'verified': False, 'reason': 'projection_failed', 'detail': str(exc)}
-                if verification.get('verified'):
-                    verification['mode'] = 'proven'
-                    verification['max_deviation_mm'] = verification['upper_bound_mm']
-                elif not settings.strict_tolerance and verification.get('reason') in {
-                        'verification_work_limit', 'distance_not_confirmed', 'projection_failed'}:
+                    verification['mode'] = mode
+                    if verification.get('verified'):
+                        verification['max_deviation_mm'] = verification['upper_bound_mm']
+                    passed = verification.get('verified', False)
+                else:
+                    tracker.update(88, f'Измерение допуска: {attempt}/3')
                     deviation = rd.measured_distance(exported, candidate, mm)
-                    if math.isfinite(deviation) and deviation <= settings.quality_mm:
-                        verification = {'verified': False, 'mode': 'measured_not_proven',
-                            'max_deviation_mm': deviation, 'strict_reason': verification.get('reason'),
-                            'reference': 'repaired_mesh_before_simplification',
-                            'method': 'bidirectional_vertices_to_surface'}
-                    else:
-                        verification = {'verified': False, 'reason': 'sample_exceeds_tolerance',
-                                        'max_deviation_mm': deviation}
-                item['verification'] = verification
-                summary['verification'] = verification
-                if verification.get('verified') or verification.get('mode') == 'measured_not_proven':
-                    os.replace(candidate_tmp, tmp)
+                    passed = math.isfinite(deviation) and deviation <= settings.quality_mm
+                    verification = {'verified': False, 'mode': mode, 'max_deviation_mm': deviation,
+                                    'reference': 'repaired_mesh_before_simplification',
+                                    'method': 'bidirectional_vertices_to_surface'}
+                    if not passed:
+                        verification['reason'] = 'sample_exceeds_tolerance'
+                item['verification'] = summary['verification'] = verification
+                if passed:
+                    accepted = candidate
                     report['after'] = candidate_info
                     summary.update(accepted=True, after=candidate_info['triangles'], accepted_attempt=attempt)
-                    if verification['mode'] == 'measured_not_proven':
-                        report['warnings'].append('Допуск упрощения измерен по вершинам в обе стороны, но не доказан для всей поверхности. Для строгой проверки включите соответствующую галочку.')
                     break
                 item['reason'] = verification.get('reason', 'distance_not_confirmed')
         except (RuntimeError, MemoryError) as exc:
             item.update(reason='native_error', detail=str(exc))
         finally:
             item['elapsed_seconds'] = time.monotonic()-t
-            candidate_tmp.unlink(missing_ok=True)
+            emit(f"Упрощение, попытка {attempt}: {item['elapsed_seconds']:.2f} с; compute_device=cpu_native_parallel.")
         emit(f"Упрощение, попытка {attempt}: {rd.reason_text(item['reason'])}")
+        measured = item.get('verification', {}).get('max_deviation_mm')
+        ratio = .5
+        if measured and math.isfinite(measured) and measured > settings.quality_mm:
+            ratio = max(.1, min(.8, .8*settings.quality_mm/measured))
+        factor *= ratio
     summary['elapsed_seconds'] = time.monotonic()-started
     if not summary['accepted']:
         summary['reason'] = summary['attempts'][-1].get('reason', 'native_error')
@@ -273,70 +390,76 @@ def simplify_attempts(exported, tmp, mm, settings, tracker, report, emit, workdi
         emit('Сохранена сетка без упрощения. ' + summary['reason_ru'])
         report['warnings'].append(summary['reason_ru'])
     emit(f"Упрощение: {summary['before']:,} → {summary['after']:,} треугольников.")
-    if summary['accepted']:
-        emit('Допуск упрощения: ' + ('подтверждён по всей поверхности.' if summary['verification'].get('verified') else 'измерен по вершинам, не доказан для всей поверхности.'))
+    report['steps'].append({'name': 'Упрощение', 'elapsed_seconds': summary['elapsed_seconds']})
+    return accepted
 
-
-def cleanup_exported(exported, path, mm, settings, tracker, report, folder, emit):
-    """Accept cleanup only after the candidate survives another STL roundtrip."""
-    started = time.monotonic()
-    item = {'accepted': False, 'before': report['after']['triangles']}
-    candidate_path = folder/'cleanup.stl'
-    try:
-        candidate = mm.Mesh(exported)
-        params = mm.FixMeshDegeneraciesParams()
-        params.mode = mm.FixMeshDegeneraciesParams.Mode.Decimate
-        params.maxDeviation = settings.quality_mm*.01
-        params.tinyEdgeLength = settings.quality_mm*.001
-        params.cb = tracker.callback(78, 79, 'Проверка очистки вырожденных граней')
-        mm.fixMeshDegeneracies(candidate, params)
-        mm.saveMesh(candidate, candidate_path)
-        candidate = mm.loadMesh(candidate_path)
-        info = diagnostics(candidate, mm)
-        if not valid(info):
-            item['reason'] = 'cleanup_topology_changed'
-        elif info['components'] != report['after']['components']:
-            item['reason'] = 'cleanup_shell_count_changed'
-        else:
-            os.replace(candidate_path, path)
-            exported = candidate
-            report['after'] = info
-            item.update(accepted=True, after=info['triangles'])
-    except (RuntimeError, MemoryError) as exc:
-        item.update(reason='cleanup_native_error', detail=str(exc))
-    finally:
-        candidate_path.unlink(missing_ok=True)
-    item['elapsed_seconds'] = time.monotonic()-started
-    report['degenerate_cleanup'] = item
-    report['steps'].append({'name': 'Проверка очистки вырожденных граней', **item})
-    if not item['accepted']:
-        message = 'Очистка вырожденных граней отклонена: изменились оболочки или корректность STL. Сохранена сетка до очистки. ['+item['reason']+']'
-        emit(message)
-        report['warnings'].append(message)
-    return exported
 
 
 def run(source, destination=None, settings=Settings(), emit=lambda message: None,
         progress=lambda event: None, work_dir=None):
+    from .storage import create_job, remove_job
     settings.validate()
     source = Path(source).resolve()
     if not source.is_file():
         raise ValueError('Входной файл не найден.')
     if source.suffix.lower() not in {'.stl', '.obj', '.ply'}:
         raise ValueError('Поддерживаются STL, OBJ и PLY.')
-    target = Path(destination).resolve() if destination else output_path(source)
-    if target == source or target.exists() or Path(str(target)+'.json').exists() or Path(str(target)+'.deviation.npz').exists():
-        raise ValueError('Выходной файл уже существует. Исходники и результаты не перезаписываются.')
-    if not target.parent.is_dir() or target.suffix.lower() != '.stl':
-        raise ValueError('Нужна существующая папка и новое имя STL.')
+    target = Path(destination).resolve() if destination else None
+    if target:
+        if target == source or any(Path(str(target)+suffix).exists() for suffix in ('', '.json', '.deviation.npz')):
+            raise ValueError('Выходной файл уже существует. Исходники и результаты не перезаписываются.')
+        if not target.parent.is_dir() or target.suffix.lower() != '.stl':
+            raise ValueError('Нужна существующая папка и новое имя STL.')
+    owned = work_dir is None
+    folder = create_job(settings.temp_directory) if owned else Path(work_dir).resolve()
+    folder.mkdir(parents=True, exist_ok=True)
+    try:
+        report = _run(source, settings, emit, progress, folder)
+        if target:
+            _publish_cli(report, target)
+        return clean_json(report)
+    except BaseException:
+        if owned:
+            remove_job(folder)
+        raise
+    finally:
+        if owned and target:
+            remove_job(folder)
+
+
+def _publish_cli(report, target):
+    """Explicit --output retains STL + JSON + deviation and no-overwrite semantics."""
+    from .storage import save_artifacts
+    # Sidecar errors must not hide a successfully published STL (legacy contract).
+    saved, _ = save_artifacts(report, target, {'stl': True}, no_replace=True)
+    report.update(output=str(target), saved_at=saved['saved_at'])
+    try:
+        if report['source_deviation'].get('heatmap_error'):
+            raise OSError(report['source_deviation']['heatmap_error'])
+        save_artifacts(report, target, {'deviation': True}, no_replace=True)
+        report['source_deviation']['heatmap_file'] = str(target)+'.deviation.npz'
+    except OSError as exc:
+        report['warnings'].append('STL сохранён, но карту отклонения записать не удалось: '+str(exc))
+    try:
+        atomic_json(str(target)+'.json', report)
+    except (OSError, ValueError, TypeError) as exc:
+        report['warnings'].append('STL сохранён, но не удалось записать JSON-отчёт: '+str(exc))
+
+
+def _run(source, settings, emit, progress, folder):
     from meshlib import mrmeshpy as mm, mrmeshnumpy as mn
     from .orientation import prepare_orientation, finite_vertices
     from .inspection import describe_mesh
     started = time.monotonic()
-    tracker = Progress(progress)
-    report = {'version': '0.8.1', 'settings': asdict(settings), 'source': str(source),
+    report = {'version': '0.9.0', 'settings': asdict(settings), 'source': str(source),
               'units': 'mm', 'tolerance_certified': False, 'warnings': [], 'steps': [],
-              'compute_device': 'cpu_native_parallel', 'acceleration': capabilities()}
+              'compute_device': 'cpu_native_parallel', 'acceleration': capabilities(settings.disable_cuda)}
+    report['stage_timings'] = []
+    tracker = Progress(progress, emit, report['stage_timings'],
+        lambda stage: report['compute_device'] if stage in {'Проба острых рёбер (шаг ×4)', 'Восстановление поверхности'}
+        else ','.join(report['acceleration'].get('projection_backends', ['cpu_native_parallel']))
+        if stage == 'Карта отклонения от исходника' or stage.startswith('Строгая проверка') else 'cpu_native_parallel')
+    emit('compute_device=cpu_native_parallel; CUDA '+('выключена настройкой.' if settings.disable_cuda else 'авто.'))
     load_settings = mm.MeshLoadSettings()
     skipped, duplicated = mm.int_output(), mm.int_output()
     load_settings.skippedFaceCount, load_settings.duplicatedVertexCount = skipped, duplicated
@@ -346,12 +469,12 @@ def run(source, destination=None, settings=Settings(), emit=lambda message: None
     if not mesh.topology.numValidFaces():
         raise ValueError('Файл не содержит пригодных треугольников.')
     mesh.pack()
+    from .storage import check_space
+    report['temporary_storage'] = check_space(folder, mesh.topology.numValidFaces())
     report['loader'] = {'skipped_faces': skipped.value, 'duplicated_vertices': duplicated.value,
                         'non_finite_vertices': 0}
     if skipped.value:
         report['warnings'].append(f'Загрузчик пропустил непригодные грани: {skipped.value}. Проверьте форму результата.')
-    center = mesh.computeBoundingBox().center()
-    mesh.transform(mm.AffineXf3f.translation(-center))
     # Keep the loaded source for final one-way deviation, not just the preconditioned mesh.
     reference = mm.Mesh(mesh)
     mesh, orientation = prepare_orientation(mesh, mm,
@@ -368,7 +491,7 @@ def run(source, destination=None, settings=Settings(), emit=lambda message: None
     report['before'], report['source_shells'] = before, shells
     before['disoriented_edges'] = orientation['disoriented_edges']
     before['skipped_faces'], before['non_finite_vertices'] = skipped.value, 0
-    info = diagnostics(mesh, mm, tracker.callback(15, 18, 'Поиск оставшихся повреждений'))
+    info = topology_info(mesh, mm)
     report['prepared'] = info
     emit(f"После согласования: треугольников {info['triangles']:,}; оболочек {info['components']}; дыр {info['boundary_loops']}.")
     from .holes import fill_simple_holes
@@ -378,30 +501,43 @@ def run(source, destination=None, settings=Settings(), emit=lambda message: None
     report['steps'].append({'name': 'Заполнение простых дыр', **hole_report})
     if hole_report['holes_after']:
         report['warnings'].append(f"После безопасного заполнения осталось дыр: {hole_report['holes_after']}. Они переданы объёмному восстановлению.")
+    tracker.update(30, 'Проверка после заполнения дыр')
     info = diagnostics(mesh, mm)
     report['after_hole_filling'] = info
-    repaired = None
+    repaired, after = local_repair(mesh, info, mm, settings, tracker, report, emit)
     t = time.monotonic()
-    if info['closed'] and not info['self_intersecting_faces']:
-        if info['components'] == 1 and valid(info):
-            repaired = mesh
+    if repaired is not None:
+        report['algorithm'] = 'local_cut_and_fill'
+        from .deviation import source_deviation
+        report['local_repair']['source_deviation'] = source_deviation(reference, repaired, mm,
+            settings.quality_mm, None, report['acceleration'], emit=emit)
+    elif valid(info):
+        if info['components'] == 1:
+            repaired, after = mesh, info
             report['algorithm'] = 'surface_repair'
         elif info['components'] <= 32:
-            # The count limits only expensive sequential CSG, never hole filling.
             try:
                 repaired = union_small(mesh, mm, tracker)
-                report['algorithm'] = 'solid_union'
-                if not valid(diagnostics(repaired, mm)):
+                after = diagnostics(repaired, mm)
+                if not valid(after):
                     repaired = None
+                report['algorithm'] = 'solid_union'
             except RuntimeError as exc:
                 report['surface_attempt_error'] = str(exc)
                 repaired = None
-        elif valid(info):
-            repaired = mesh
+        else:
+            repaired, after = mesh, info
             report['algorithm'] = 'closed_components_preserved'
     if repaired is None:
-        repaired = sparse_repair(mesh, mm, settings, tracker, report, emit)
-        reason = 'После заполнения дыр остались открытые фрагменты или пересечения; требуется воксельное восстановление.'
+        center = mesh.computeBoundingBox().center()
+        centered = mm.Mesh(mesh)
+        centered.transform(mm.AffineXf3f.translation(-center))
+        repaired = sparse_repair(centered, mm, settings, tracker, report, emit)
+        repaired.transform(mm.AffineXf3f.translation(center))
+        after = None
+        reason = 'После локального ремонта остались повреждения; выполнено воксельное восстановление.'
+    elif report['algorithm'] == 'local_cut_and_fill':
+        reason = 'Самопересечения устранены локально методом CutAndFill, без вокселизации модели.'
     else:
         reason = 'Ориентация и заполнение простых дыр позволили сохранить поверхность без вокселей.'
     report['algorithm_reason'] = reason
@@ -409,68 +545,106 @@ def run(source, destination=None, settings=Settings(), emit=lambda message: None
                             'algorithm': report['algorithm'], 'reason': reason})
     emit(reason)
     if repaired is None or not repaired.topology.numValidFaces():
-        raise RuntimeError('Не удалось восстановить непустую поверхность при выбранном качестве. Файл не сохранён.')
-    t = time.monotonic()
-    after = diagnostics(repaired, mm, tracker.callback(65, 70, 'Проверка восстановленной сетки'))
+        raise RuntimeError('Не удалось восстановить непустую поверхность при выбранном качестве.')
+    tracker.update(66, 'Проверка восстановленной сетки')
+    if after is None:
+        after = diagnostics(repaired, mm, tracker.callback(66, 70, 'Проверка восстановленной сетки'))
     if not valid(after):
-        raise RuntimeError(f"Результат не прошёл проверку: дыр {after['boundary_loops']}; пересечений {after['self_intersecting_faces']}. Файл не сохранён.")
-    report['steps'].append({'name': 'Проверка результата', 'elapsed_seconds': time.monotonic()-t})
-    emit(f"После ремонта: {info['triangles']:,} → {after['triangles']:,} треугольников; затем выполняется упрощение, если включено.")
-    repaired.transform(mm.AffineXf3f.translation(center))
-    reference.transform(mm.AffineXf3f.translation(center))
-    mesh = None
-    # GUI creates and owns this one directory; after a kill it cleans only its
-    # own job, never a glob of temporary files belonging to other instances.
-    owned = tempfile.TemporaryDirectory(prefix='.meshrepair-', dir=target.parent) if work_dir is None else None
-    folder = Path(owned.name if owned else work_dir)
-    folder.mkdir(parents=True, exist_ok=True)
-    tmp = folder/'result.stl'
-    try:
-        t = time.monotonic()
-        save_settings = mm.SaveSettings()
-        save_settings.progress = tracker.callback(72, 74, 'Запись результата')
-        mm.saveMesh(repaired, tmp, save_settings)
-        repaired = None
-        exported = mm.loadMesh(tmp)
-        report['after'] = diagnostics(exported, mm, tracker.callback(75, 78, 'Контроль сохранённого STL'))
-        if not valid(report['after']):
-            raise RuntimeError('STL после сохранения не прошёл проверку.')
-        report['steps'].append({'name': 'Запись и повторная проверка STL', 'elapsed_seconds': time.monotonic()-t})
-        if report['algorithm'] == 'sparse_openvdb_winding':
-            exported = cleanup_exported(exported, tmp, mm, settings, tracker, report, folder, emit)
-        if settings.collapse_coplanar or settings.simplify_curved:
-            simplify_attempts(exported, tmp, mm, settings, tracker, report, emit, folder)
-        final = mm.loadMesh(tmp)
-        from .deviation import source_deviation
-        map_tmp = folder/'deviation.npz'
-        report['source_deviation'] = source_deviation(reference, final, mm, settings.quality_mm,
-            map_tmp, report['acceleration'], tracker.callback(96, 99, 'Карта отклонения от исходника'), emit)
-        deviation = report['source_deviation']['max_deviation_mm']
-        if not math.isfinite(deviation) or deviation > 2*settings.quality_mm:
-            report['warnings'].append(f'Отклонение вершин исходника от результата {deviation:.6g} мм больше двух шагов ({2*settings.quality_mm:g} мм). Проверьте потерянные детали, полости и места ремонта.')
+        raise RuntimeError(f"Результат не прошёл проверку: дыр {after['boundary_loops']}; пересечений {after['self_intersecting_faces']}. "
+                           'Файл не сохранён. Попробуйте выключить восстановление острых рёбер.')
+    report['after'] = after
+    # Retain valid native stages for a failed final STL round-trip, never disk copies.
+    fallbacks = []
+    if settings.remove_small_shells:
         from .inspection import shell_summary
-        summary, report['shells'] = shell_summary(final, mm)
-        report['after'].update(summary)
-        count = report['after']['components']
-        if count > 1:
-            report['warnings'].append(f'В файле {count} замкнутых оболочек. Раздельные детали сохранены; перемычки не добавлялись.')
-        report.update(status='repaired' if count == 1 else 'repaired_multiple_shells', output=str(target),
-                      elapsed_seconds=time.monotonic()-started)
-        publish_stl(tmp, target)
-        try:
-            if report['source_deviation'].get('heatmap_error'):
-                raise OSError(report['source_deviation']['heatmap_error'])
-            map_target = Path(str(target)+'.deviation.npz')
-            publish_stl(map_tmp, map_target)
-            report['source_deviation']['heatmap_file'] = str(map_target)
-        except OSError as exc:
-            report['warnings'].append('STL сохранён, но карту отклонения записать не удалось: '+str(exc))
-        try:
-            atomic_json(str(target)+'.json', report, temp_dir=folder)
-        except (OSError, ValueError, TypeError) as exc:
-            report['warnings'].append('STL сохранён, но не удалось записать JSON-отчёт: '+str(exc))
-    finally:
-        if owned:
-            owned.cleanup()
+        _, shells = shell_summary(repaired, mm)
+        regions = mm.MeshComponents.getAllComponents(mm.MeshPart(repaired))
+        small = mm.FaceBitSet()
+        for region in regions:
+            if region.count() < 50:
+                small |= region
+        removed = [shell for shell in shells if shell['triangles'] < 50]
+        report['removed_shells'] = removed
+        if small.count() and small.count() < repaired.topology.numValidFaces():
+            fallbacks.append((repaired, after, 'small_shells'))
+            repaired = repaired.cloneRegion(repaired.topology.getValidFaces()-small)
+            after = dict(topology_info(repaired, mm), self_intersecting_faces=0)
+            report['after'] = after
+            emit(f'Удалено мелких оболочек: {len(removed)}.')
+        elif small.count():
+            report['warnings'].append('Все оболочки мелкие; удаление отменено, чтобы не получить пустой результат.')
+            report['removed_shells'] = []
+    emit(f"После ремонта: {info['triangles']:,} → {after['triangles']:,} треугольников.")
+    tmp = folder/'result.stl'
+    final = repaired
+    if settings.collapse_coplanar or settings.simplify_curved:
+        final = simplify_attempts(repaired, None, mm, settings, tracker, report, emit, folder)
+        if final is not repaired:
+            fallbacks.append((repaired, after, 'simplification'))
+    else:
+        count = mm.findDegenerateFaces(mm.MeshPart(final)).count()
+        report['degenerate_faces_before_cleanup'] = count
+        if count:
+            final = cleanup_exported(repaired, None, mm, settings, tracker, report, folder, emit)
+            if final is not repaired:
+                fallbacks.append((repaired, after, 'cleanup'))
+    t = time.monotonic()
+    roundtrips = []
+    while True:
+        save_settings = mm.SaveSettings()
+        save_settings.progress = tracker.callback(96, 97, 'Запись итогового STL')
+        mm.saveMesh(final, tmp, save_settings)
+        exported = mm.loadMesh(tmp)
+        final_info = diagnostics(exported, mm, tracker.callback(97, 98, 'Контроль итогового STL'))
+        roundtrips.append(final_info)
+        if valid(final_info):
+            shells_changed = final_info['components'] != report['after']['components']
+            if not shells_changed or not fallbacks:
+                if shells_changed:
+                    # STL stores triangle soup. Its loader can split coincident
+                    # voxel seams even when both meshes are closed and valid.
+                    # Optional changes are rolled back first; a valid base is
+                    # still usable, with the actual exported topology reported.
+                    report['export_topology'] = {'before': report['after'], 'after': final_info}
+                    report['warnings'].append(f"STL изменил связность при загрузке: {report['after']['components']} → "
+                        f"{final_info['components']} оболочек. Замкнутость, топология и отсутствие пересечений проверены; "
+                        'проверьте раздельные фрагменты. [stl_shell_count_changed]')
+                break
+        if not fallbacks:
+            raise RuntimeError('Итоговый STL не прошёл проверку; проверенные стадии исчерпаны.')
+        final, restored, stage = fallbacks.pop()
+        report['after'] = restored
+        report['warnings'].append(f'Итоговый STL не прошёл проверку; откат стадии [{stage}] и повторная запись.')
+        if stage == 'simplification':
+            from .reduction import reason_text
+            reason_code = 'export_validation_failed'
+            report['simplification'].update(accepted=False, after=restored['triangles'], reason=reason_code,
+                                             reason_ru=reason_text(reason_code))
+        elif stage == 'small_shells':
+            report['removed_shells'] = []
+        elif stage == 'cleanup':
+            report['degenerate_cleanup'].update(accepted=False, reason='export_validation_failed')
+    report['after'] = final_info
+    report['final_roundtrips'] = len(roundtrips)
+    report['steps'].append({'name': 'Запись и повторная проверка итогового STL', 'elapsed_seconds': time.monotonic()-t})
+    from .deviation import source_deviation
+    map_tmp = folder/'deviation.npz'
+    report['source_deviation'] = source_deviation(reference, exported, mm, settings.quality_mm,
+        map_tmp, report['acceleration'], tracker.callback(98, 99, 'Карта отклонения от исходника'), emit)
+    report['source_deviation']['heatmap_file'] = str(map_tmp)
+    deviation = report['source_deviation']['max_deviation_mm']
+    if not math.isfinite(deviation) or deviation > 2*settings.quality_mm:
+        report['warnings'].append(f'Отклонение вершин исходника от результата {deviation:.6g} мм больше двух шагов ({2*settings.quality_mm:g} мм). Проверьте места ремонта.')
+    from .inspection import shell_summary
+    summary, report['shells'] = shell_summary(exported, mm)
+    report['after'].update(summary)
+    count = report['after']['components']
+    if count > 1:
+        report['warnings'].append(f'В файле {count} замкнутых оболочек. Раздельные детали сохранены; перемычки не добавлялись.')
+    report.update(status='repaired' if count == 1 else 'repaired_multiple_shells', output=str(tmp),
+                  artifacts={'stl': str(tmp), 'deviation': str(map_tmp)}, work_directory=str(folder),
+                  elapsed_seconds=time.monotonic()-started)
+    emit(f"Карта отклонения: {report['source_deviation']['elapsed_seconds']:.2f} с; "
+         f"проекции={','.join(report['acceleration'].get('projection_backends', []))}.")
     tracker.update(100, 'Готово')
-    return clean_json(report)
+    return report

@@ -39,7 +39,7 @@ def propose_reduction(mesh, mm, settings, progress, error_scale=1.0):
         candidate.packOptimally(False)
         params = mm.DecimateSettings()
         # The SDK's maxError is an estimate. Acceptance is decided by the
-        # independent surface bound after the actual exported STL is reloaded.
+        # independent distance check on the candidate in memory.
         params.maxError = settings.quality_mm * error_scale
         params.maxAngleChange = -1  # this property controls edge FLIPS, not coplanarity
         params.tinyEdgeLength = 0
@@ -217,6 +217,7 @@ def verify_surface_bound(reference, candidate, tolerance, progress=lambda value:
     checked = 0
     completed = 0
     maximum = 0.0
+    measured_maximum = 0.0
     for direction in range(2):
         source_faces, source_verts = faces[direction], vertices[direction]
         target_faces, target_verts = faces[1 - direction], vertices[1 - direction]
@@ -231,18 +232,21 @@ def verify_surface_bound(reference, candidate, tolerance, progress=lambda value:
                 tris, depth = stack.pop()
                 checked += len(tris)
                 if checked > max_checks:
-                    return {'verified': False, 'reason': 'verification_work_limit', 'checked_subtriangles': checked}
+                    return {'verified': False, 'reason': 'verification_work_limit', 'checked_subtriangles': checked,
+                            'max_deviation_mm': measured_maximum}
                 centers = tris.mean(axis=1).astype(np.float32)
                 projections = mm.std_vector_MeshProjectionResult()
                 projector.findProjections(projections, mn.fromNumpyArray(centers), None, None,
                                           float(np.finfo(np.float32).max), 0)
                 ids, distances = projection_arrays(projections, mm)
+                measured_maximum = max(measured_maximum, math.sqrt(float(distances.max())))
                 if (ids < 0).any() or (ids >= len(target_faces)).any():
                     return {'verified': False, 'reason': 'projection_failed'}
                 # A sampled violation may safely reject a proposal; samples alone
                 # are never used to ACCEPT it.
                 if (distances > tolerance * tolerance).any():
-                    return {'verified': False, 'reason': 'sample_exceeds_tolerance', 'checked_subtriangles': checked}
+                    return {'verified': False, 'reason': 'sample_exceeds_tolerance', 'checked_subtriangles': checked,
+                            'max_deviation_mm': measured_maximum}
                 bounds = triangle_upper_bounds(tris, target_verts[target_faces[ids]])
                 unresolved = np.flatnonzero(bounds > limit)
                 if len(unresolved):
@@ -264,7 +268,8 @@ def verify_surface_bound(reference, candidate, tolerance, progress=lambda value:
                 bad = tris[~good]
                 if len(bad):
                     if depth >= max_depth:
-                        return {'verified': False, 'reason': 'distance_not_confirmed', 'checked_subtriangles': checked}
+                        return {'verified': False, 'reason': 'distance_not_confirmed', 'checked_subtriangles': checked,
+                                'max_deviation_mm': measured_maximum}
                     # Bisect longest edge. Both children cover their whole parent.
                     lengths = np.stack([np.sum((bad[:, 0] - bad[:, 1]) ** 2, axis=1),
                                         np.sum((bad[:, 1] - bad[:, 2]) ** 2, axis=1),
@@ -338,6 +343,7 @@ def measured_distance(reference, candidate, mm):
 
 
 REASONS = {
+    'export_validation_failed': 'Итоговый STL не прошёл проверку; восстановлена предыдущая стадия из памяти.',
     'topology_changed': 'После упрощения появились дыры или самопересечения.',
     'kept_shell_count_changed': 'После упрощения изменилось число оболочек.',
     'sample_exceeds_tolerance': 'Измеренное отклонение превышает заданный допуск.',

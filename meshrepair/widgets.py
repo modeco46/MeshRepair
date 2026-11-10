@@ -3,7 +3,7 @@ from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QLocale, QSize
 from PySide6.QtGui import QColor, QFont, QPainter
 from PySide6.QtWidgets import (QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QFrame, QDoubleSpinBox, QCheckBox, QProgressBar, QPlainTextEdit, QSplitter,
-    QTabWidget, QTableView, QHeaderView, QScrollArea, QSizePolicy)
+    QTabWidget, QTableView, QHeaderView, QScrollArea, QSizePolicy, QLineEdit)
 from .viewer import MeshView
 
 
@@ -146,7 +146,7 @@ class LayoutMixin:
             header.addWidget(frame, 3 if key == 'triangles' else 2)
         self.hardware = label('CPU / CUDA · авто', 'badge')
         header.addWidget(self.hardware)
-        header.addWidget(label('0.8.1', 'muted'))
+        header.addWidget(label('0.9.0', 'muted'))
         outer.addWidget(self.header)
 
         body = QHBoxLayout()
@@ -206,11 +206,23 @@ class LayoutMixin:
         self.sharp.setToolTip('Sharpening после вокселизации. На шумных и тонких поверхностях возможны выбросы; проверяйте карту отклонения.')
         layout.addWidget(self.sharp)
         self.strict = QCheckBox('Строго доказывать допуск')
-        self.strict.setToolTip('Выкл.: допускается измерение по вершинам. Вкл.: требуется численное ограничение всей поверхности.')
+        self.strict.setToolTip('Выкл.: быстрое измерение по вершинам в обе стороны. Вкл.: численное доказательство для всей поверхности.')
         layout.addWidget(self.strict)
         self.weld_close = QCheckBox('Склеивать близкие вершины')
         self.weld_close.setToolTip('Допуск склейки = 0,1 × качество. Может изменить мелкие детали. По умолчанию выключено.')
         layout.addWidget(self.weld_close)
+        self.remove_small = QCheckBox('Удалять мелкие оболочки\n(< 50 граней)')
+        layout.addWidget(self.remove_small)
+        self.no_cuda = QCheckBox('Без CUDA')
+        layout.addWidget(self.no_cuda)
+        self.autosave = QCheckBox('Сохранять автоматически\nрядом с исходником')
+        layout.addWidget(self.autosave)
+        layout.addWidget(label('Папка временных файлов', 'muted'))
+        self.temp_folder = QLineEdit()
+        self.temp_folder.setMinimumWidth(0)
+        self.temp_folder.setPlaceholderText('Системная временная папка')
+        self.temp_folder.setToolTip('Пусто — системный temp. Можно указать папку на RAM-диске.')
+        layout.addWidget(self.temp_folder)
         layout.addWidget(label('Допуск упрощения отсчитывается\nот уже исправленной поверхности.', 'muted', True))
         left.addWidget(settings)
         footer = QVBoxLayout()
@@ -224,7 +236,10 @@ class LayoutMixin:
         actions.addWidget(self.check_button)
         actions.addWidget(self.stop_button)
         footer.addLayout(actions)
-        footer.addWidget(label('Результат — новый STL рядом\nс исходником. Исходник сохраняется.', 'muted', True))
+        self.save_button = button('Сохранить…', self.save_result)
+        self.save_button.setToolTip('Сохранить выбранные файлы результата (Ctrl+S).')
+        footer.addWidget(self.save_button)
+        footer.addWidget(label('Результат во временной папке.\nВыберите «Сохранить…» для записи.', 'muted', True))
         left.addStretch()
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)

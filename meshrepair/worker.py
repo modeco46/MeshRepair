@@ -14,7 +14,7 @@ def main():
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, 'reconfigure'):
             stream.reconfigure(encoding='utf-8', errors='replace')
-    parser = argparse.ArgumentParser(description='MeshRepair 0.8.1 — ремонт сеток')
+    parser = argparse.ArgumentParser(description='MeshRepair 0.9.0 — ремонт сеток')
     parser.add_argument('source')
     parser.add_argument('--output')
     parser.add_argument('--quality', type=float, default=.02)
@@ -24,6 +24,11 @@ def main():
     parser.add_argument('--strict-tolerance', action='store_true')
     parser.add_argument('--weld-close-vertices', action='store_true')
     parser.add_argument('--no-restore-sharp-edges', action='store_true')
+    parser.add_argument('--remove-small-shells', action='store_true')
+    parser.add_argument('--no-cuda', action='store_true')
+    parser.add_argument('--temp-directory', default='')
+    parser.add_argument('--local-fix-max-faces', type=int, default=200)
+    parser.add_argument('--local-fix-fraction', type=float, default=.001)
     parser.add_argument('--result-file')
     parser.add_argument('--work-dir')
     parser.add_argument('--debug', action='store_true')
@@ -47,8 +52,15 @@ def main():
             result = export_preview(args.source, args.preview_output, progress)
         else:
             settings = Settings(args.quality, args.collapse_coplanar, args.coplanar_angle,
-                                args.simplify_curved, args.strict_tolerance, args.weld_close_vertices, not args.no_restore_sharp_edges)
+                                args.simplify_curved, args.strict_tolerance, args.weld_close_vertices, not args.no_restore_sharp_edges,
+                                args.local_fix_max_faces, args.local_fix_fraction, args.remove_small_shells,
+                                args.no_cuda, args.temp_directory)
             result = run(args.source, args.output, settings, log, progress, work_dir=args.work_dir)
+            if not args.output and not args.work_dir:
+                # Standalone worker artifacts remain usable by its caller. GUI
+                # supplies its own job and owns cleanup; orphan cleanup handles CLI.
+                from .storage import release_job
+                release_job(result['work_directory'])
         terminal('result', result)
         return 0
     except Exception as exc:

@@ -192,15 +192,12 @@ def test_patch_collision_rolls_back_original_geometry(monkeypatch):
     mesh.topology.deleteFace(mm.FaceId(0))
     before_v = mn.getNumpyVerts(mesh).copy()
     before_f = mn.getNumpyFaces(mesh.topology).copy()
-    native = mm.findSelfCollidingTrianglesBS
-    calls = []
-    def collide(part):
-        result = native(part)
-        if calls:
-            result.autoResizeSet(mm.FaceId(0))
-        calls.append(True)
+    from meshrepair import holes
+    def collide(*args):
+        result = mm.FaceBitSet()
+        result.autoResizeSet(mm.FaceId(0))
         return result
-    monkeypatch.setattr(mm, 'findSelfCollidingTrianglesBS', collide)
+    monkeypatch.setattr(holes, 'patch_collisions', collide)
     result,r = fill_simple_holes(mesh,mm,.02)
     assert r['rejected'] == 1 and r['holes_after'] == 1
     np.testing.assert_array_equal(mn.getNumpyVerts(result),before_v)
