@@ -348,3 +348,8 @@ class LayoutMixin:
         self.progress.setTextVisible(False)
         self.progress.setFixedHeight(7)
         outer.addWidget(self.progress)
+        # Native font metrics differ between Segoe UI and the Linux fallback.
+        # Propagate the content's real minimum width through the scroll area
+        # instead of allowing it to extend underneath the vertical scrollbar.
+        sidebar.ensurePolished()
+        self.sidebar.setMinimumWidth(max(292, sidebar.minimumSizeHint().width()+12))

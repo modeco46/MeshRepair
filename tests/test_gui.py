@@ -72,6 +72,8 @@ def exercise(name, tmp_path):
             for width, height in [(980, 680), (1280, 880), (1920, 1080)]:
                 window.resize(width, height)
                 app.processEvents()
+                QTest.qWait(50)  # Process deferred scroll-area layout requests too.
+                app.processEvents()
                 assert window.width() == width, (width, window.size().toTuple())
                 assert window.header.height() <= 50
                 assert window.check_button.text() == 'Проверить'
@@ -90,8 +92,9 @@ def exercise(name, tmp_path):
                 for a, b in zip(window.stat_chips, window.stat_chips[1:]):
                     assert a.geometry().right() < b.geometry().left()
                 # No clipped input/spin arrows inside the sidebar scroll viewport.
-                assert window.quality.mapTo(window.sidebar, QPoint(window.quality.width(), 0)).x() <= window.sidebar.width()
-                assert window.sharp.mapTo(window.sidebar, QPoint(window.sharp.width(), 0)).x() <= window.sidebar.width()
+                for control in (window.quality, window.sharp):
+                    right = control.mapTo(window.sidebar, QPoint(control.width(), 0)).x()
+                    assert right <= window.sidebar.width(), (width, control.size().toTuple(), right, window.sidebar.width(), window.sidebar.minimumWidth())
         elif name == 'repair':
             window.set_source(source)
             pump(app, window)
