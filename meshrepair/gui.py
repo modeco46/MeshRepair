@@ -15,6 +15,8 @@ from .theme import STYLE
 from .viewer import PreviewLoader
 from .widgets import LayoutMixin
 from .reporting import report_html
+from .protocol import ProgressTail
+from .runtime import worker_program
 
 
 class App(QMainWindow, LayoutMixin):
@@ -46,10 +48,14 @@ class App(QMainWindow, LayoutMixin):
         self.retry_report = None
         self.job_retry_report = None
         self.job_settings = None
+        self.job_progress_tail = None
         self.setup_ui(preview_enabled and os.environ.get('MESHREPAIR_NO_3D') != '1')
         self.clock = QTimer(self)
         self.clock.setInterval(250)
         self.clock.timeout.connect(self.update_clock)
+        self.progress_timer = QTimer(self)
+        self.progress_timer.setInterval(200)
+        self.progress_timer.timeout.connect(self.read_progress_file)
         QShortcut(QKeySequence.Open, self, activated=self.pick_source)
         QShortcut(QKeySequence.Save, self, activated=self.save_result)
         if self.preferences:
@@ -210,7 +216,9 @@ class App(QMainWindow, LayoutMixin):
             self.status.setText('Не удалось создать временную папку.')
             return
         self.job_result_file = self.job_directory / 'worker-result.json'
+        self.job_progress_tail = ProgressTail(self.job_directory / 'progress.jsonl')
         command += [str(path), '--result-file', str(self.job_result_file), '--work-dir', str(self.job_directory)]
+        command += ['--progress-file', str(self.job_progress_tail.path)]
         if operation == 'check':
             command += ['--check']
         elif operation == 'preview':
@@ -262,7 +270,21 @@ class App(QMainWindow, LayoutMixin):
         process.finished.connect(self.worker_finished)
         process.errorOccurred.connect(self.process_error)
         self.process = process
-        process.start(sys.executable, command)
+        if sys.platform == 'win32' and hasattr(process, 'setCreateProcessArgumentsModifier'):
+            def hide_console(arguments):
+                arguments.flags |= 0x08000000  # CREATE_NO_WINDOW
+            process.setCreateProcessArgumentsModifier(hide_console)
+        self.progress_timer.start()
+        process.start(worker_program(), command)
+
+    def read_progress_file(self):
+        if self.job_progress_tail is not None:
+            try:
+                for line in self.job_progress_tail.read():
+                    self.handle_line(line)
+            except OSError as exc:
+                self.write('Не удалось прочитать прогресс: '+str(exc))
+                self.progress_timer.stop()
 
     def process_error(self, error):
         if error == QProcess.FailedToStart:
@@ -276,7 +298,10 @@ class App(QMainWindow, LayoutMixin):
         self.raw_output += bytes(self.process.readAllStandardOutput())
         while b'\n' in self.raw_output:
             line, self.raw_output = self.raw_output.split(b'\n', 1)
-            self.handle_line(line.decode('utf-8', errors='replace').rstrip())
+            # Source CLI workers also emit stdout for external callers. The GUI
+            # consumes protocol events only from the file to avoid duplicates.
+            if self.job_progress_tail is None or not line.startswith(b'{"type":'):
+                self.handle_line(line.decode('utf-8', errors='replace').rstrip())
 
     def handle_line(self, line):
         try:
@@ -316,6 +341,8 @@ class App(QMainWindow, LayoutMixin):
     def worker_finished(self, code, exit_status):
         if self.process is None:
             return
+        self.progress_timer.stop()
+        self.read_progress_file()
         self.read_worker()
         if self.raw_output:
             self.handle_line(self.raw_output.decode('utf-8', errors='replace'))
@@ -543,6 +570,8 @@ class App(QMainWindow, LayoutMixin):
         return answer == QMessageBox.Discard
 
     def cleanup_job(self):
+        self.progress_timer.stop()
+        self.job_progress_tail = None
         remove_job(self.job_directory)
         self.job_directory = self.job_result_file = None
 

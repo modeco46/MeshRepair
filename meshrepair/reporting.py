@@ -113,10 +113,29 @@ def report_html(report):
             if attempt.get('reason'):
                 text += '. '+reason_text(attempt['reason'])
             line(text)
+        if reduction.get('stages'):
+            line('Треугольники после проходов: '+ ' → '.join(
+                fmt(stage.get('after_with_protected', stage['after'])) for stage in reduction['stages']))
         if not accepted:
             line(reduction.get('reason_ru', reason_text(reduction.get('reason','native_error'))), 'bad')
     else:
         line('Не запрошено.' if after else 'Выполняется при ремонте, если включено в настройках.')
+    distribution = report.get('triangle_distribution')
+    if distribution:
+        section('Где остались треугольники')
+        line(f"Большие плоскости: {fmt(distribution['large_planes_triangles'])} "
+             f"({distribution['large_planes_fraction']:.1%}); остальная поверхность: "
+             f"{fmt(distribution['other_triangles'])} ({distribution['other_fraction']:.1%}).")
+        line('Оценка по кластерам нормалей ±8° площадью > 3 мм²; рёбра, скругления и шум могут попадать в остальную поверхность.')
+        for plane in distribution['planes']:
+            normal = ', '.join(f'{v:.2f}' for v in plane['normal'])
+            line(f"Плоскость {plane['id']} (нормаль {normal}): {plane['triangles']} треугольников, "
+                 f"{plane['fraction']:.1%}; остаток исходника p50 / p90: "
+                 f"{fmt(plane['source_residual_p50_mm'])} / {fmt(plane['source_residual_p90_mm'])} мм.")
+            if plane['rougher_than_tolerance']:
+                line('Грань шершавая сильнее допуска, полигоны на ней сохраняются; увеличьте допуск.', 'warning')
+        line('Эвристическая подсказка: при допуске ×2,5 возможно примерно −25% треугольников. '
+             'Без перерасчёта; результат зависит от формы и шума.')
     section('Предупреждения')
     for warning in report.get('warnings', []):
         line('⚠ '+warning, 'warning')

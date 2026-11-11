@@ -1,5 +1,8 @@
 """Source and PyInstaller entrypoint."""
 import sys
+from meshrepair.runtime import configure
+
+configure()
 
 if __name__ == "__main__":
     if "--worker" in sys.argv:
@@ -20,6 +23,12 @@ if __name__ == "__main__":
         view = MeshView(enabled=True)
         view.shutdown()  # Load the actual Qt/VTK bridge without requiring CI GPU hardware.
     elif "--smoke-ui" in sys.argv:
+        if '--console-state' in sys.argv:
+            import ctypes
+            import json
+            from pathlib import Path
+            window = int(ctypes.windll.kernel32.GetConsoleWindow()) if sys.platform == 'win32' else 0
+            Path(sys.argv[sys.argv.index('--console-state')+1]).write_text(json.dumps({'console_window': window}))
         from meshrepair.gui import main
         raise SystemExit(main(smoke=True))
     else:

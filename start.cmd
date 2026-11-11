@@ -7,8 +7,7 @@ if not exist ".venv\Scripts\python.exe" (
 )
 .venv\Scripts\python.exe -m pip install --only-binary=:all: -r requirements.txt
 if errorlevel 1 goto failed
-.venv\Scripts\python.exe launch.py
-if errorlevel 1 goto failed
+start "" ".venv\Scripts\pythonw.exe" launch.py
 exit /b 0
 :python_missing
 echo Install Python 3.12 x64 from https://www.python.org/downloads/windows/

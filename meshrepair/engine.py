@@ -364,82 +364,123 @@ def cleanup_exported(exported, path, mm, settings, tracker, report, folder, emit
 
 
 def simplify_attempts(exported, tmp, mm, settings, tracker, report, emit, workdir):
-    """Validate small candidates in memory; return the accepted mesh or original."""
+    """Search measured error against the unchanged repaired reference; prove once."""
     from . import reduction as rd
     original = report['after']
     mode = 'proven' if settings.strict_tolerance else 'measured_not_proven'
+    target = .95 * settings.quality_mm
     summary = {'requested': True, 'accepted': False, 'before': original['triangles'],
                'after': original['triangles'], 'tolerance_mm': settings.quality_mm,
+               'measured_target_mm': target, 'scale_range': [.15, .8],
                'strict_tolerance': settings.strict_tolerance, 'mode': mode,
                'input_triangles': report.get('before', {}).get('triangles'), 'attempts': []}
     report['simplification'] = summary
     emit('Режим допуска: '+('доказано (строгая проверка).' if settings.strict_tolerance else 'измерено (вершины в обе стороны).'))
     started = time.monotonic()
-    factor = .25
-    accepted = exported
-    for attempt in range(1, 4):
-        item = {'attempt': attempt, 'error_scale': factor, 'max_error_mm': settings.quality_mm*factor}
+
+    def propose(factor, phase):
+        item = {'attempt': len(summary['attempts'])+1, 'phase': phase,
+                'error_scale': factor, 'max_error_mm': settings.quality_mm*factor}
         summary['attempts'].append(item)
         t = time.monotonic()
         try:
             candidate, stages = rd.propose_reduction(exported, mm, settings, tracker, error_scale=factor)
-            item['stages'] = summary['stages'] = stages
+            item['stages'] = stages
             if candidate.topology.numValidFaces() >= original['triangles']:
                 item['reason'] = 'no_reducible_edges'
-                break
-            candidate_info = diagnostics(candidate, mm, tracker.callback(86, 88, 'Проверка упрощённой сетки'))
-            if not valid(candidate_info) and mm.findDegenerateFaces(mm.MeshPart(candidate)).count():
-                cleanup_report = {'after': candidate_info, 'steps': [], 'warnings': []}
+                return None, None, item
+            info = diagnostics(candidate, mm, tracker.callback(86, 88, 'Проверка упрощённой сетки'))
+            if not valid(info) and mm.findDegenerateFaces(mm.MeshPart(candidate)).count():
+                cleanup_report = {'after': info, 'steps': [], 'warnings': []}
                 candidate = cleanup_exported(candidate, None, mm, settings, tracker, cleanup_report, None, emit)
-                candidate_info = cleanup_report['after']
+                info = cleanup_report['after']
                 item['cleanup'] = cleanup_report['degenerate_cleanup']
-            item['candidate'] = candidate_info
-            if not valid(candidate_info):
+            item['candidate'] = info
+            if not valid(info):
                 item['reason'] = 'topology_changed'
-            elif candidate_info['components'] != original['components']:
+            elif info['components'] != original['components']:
                 item['reason'] = 'kept_shell_count_changed'
             else:
-                if settings.strict_tolerance:
-                    verification = rd.verify_surface_bound(exported, candidate, settings.quality_mm,
-                        tracker.callback(88, 96, f'Строгая проверка допуска: {attempt}/3'),
-                        acceleration=report['acceleration'], emit=emit)
-                    verification['mode'] = mode
-                    if verification.get('verified'):
-                        verification['max_deviation_mm'] = verification['upper_bound_mm']
-                    passed = verification.get('verified', False)
-                else:
-                    tracker.update(88, f'Измерение допуска: {attempt}/3')
-                    deviation = rd.measured_distance(exported, candidate, mm)
-                    passed = math.isfinite(deviation) and deviation <= settings.quality_mm
-                    verification = {'verified': False, 'mode': mode, 'max_deviation_mm': deviation,
-                                    'reference': 'repaired_mesh_before_simplification',
-                                    'method': 'bidirectional_vertices_to_surface'}
-                    if not passed:
-                        verification['reason'] = 'sample_exceeds_tolerance'
-                item['verification'] = summary['verification'] = verification
-                if passed:
-                    accepted = candidate
-                    report['after'] = candidate_info
-                    summary.update(accepted=True, after=candidate_info['triangles'], accepted_attempt=attempt)
-                    break
-                item['reason'] = verification.get('reason', 'distance_not_confirmed')
+                tracker.update(88, f"Подбор допуска: {item['attempt']}")
+                deviation = rd.measured_distance(exported, candidate, mm)
+                item['verification'] = {'verified': False, 'mode': 'measured_not_proven',
+                    'max_deviation_mm': deviation, 'reference': 'repaired_mesh_before_simplification',
+                    'method': 'bidirectional_vertices_to_surface'}
+                if math.isfinite(deviation) and deviation <= target:
+                    return candidate, info, item
+                item['reason'] = 'sample_exceeds_tolerance'
         except (RuntimeError, MemoryError) as exc:
             item.update(reason='native_error', detail=str(exc))
         finally:
             item['elapsed_seconds'] = time.monotonic()-t
-            emit(f"Упрощение, попытка {attempt}: {item['elapsed_seconds']:.2f} с; compute_device=cpu_native_parallel.")
-        emit(f"Упрощение, попытка {attempt}: {rd.reason_text(item['reason'])}")
-        measured = item.get('verification', {}).get('max_deviation_mm')
-        ratio = .5
-        if measured and math.isfinite(measured) and measured > settings.quality_mm:
-            ratio = max(.1, min(.8, .8*settings.quality_mm/measured))
-        factor *= ratio
-    summary['elapsed_seconds'] = time.monotonic()-started
-    if not summary['accepted']:
-        summary['reason'] = summary['attempts'][-1].get('reason', 'native_error')
+            emit(f"Упрощение, попытка {item['attempt']}: {item['elapsed_seconds']:.2f} с; compute_device=cpu_native_parallel.")
+        return None, None, item
+
+    best = None
+    low, high = .15, .8
+    for iteration in range(6):
+        factor = (low+high)/2
+        candidate, info, item = propose(factor, 'search')
+        if candidate is None:
+            high = factor
+            if item.get('reason') == 'no_reducible_edges':
+                break
+        else:
+            low = factor
+            # QEM is not strictly monotone in scale. Retain the smallest valid
+            # candidate, even if a later, larger scale gives a worse mesh.
+            if best is None or info['triangles'] < best[1]['triangles']:
+                best = candidate, info, item
+            if item['verification']['max_deviation_mm'] < settings.quality_mm*1e-4:
+                # Exact planar collapse has no unused curved error budget.
+                break
+            if item['verification']['max_deviation_mm'] >= target*.99:
+                summary['search_stop'] = 'within_one_percent_of_measured_target'
+                break
+
+    # Strict proof is intentionally outside the binary search. Each proof and
+    # every retry uses the original repaired surface, never the previous pass.
+    if best is not None and settings.strict_tolerance:
+        for proof_attempt in range(3):
+            candidate, info, item = best
+            t = time.monotonic()
+            try:
+                verification = rd.verify_surface_bound(exported, candidate, settings.quality_mm,
+                    tracker.callback(88, 96, f'Строгая проверка допуска: {proof_attempt+1}/3'),
+                    acceleration=report['acceleration'], emit=emit)
+            except (RuntimeError, MemoryError) as exc:
+                verification = {'verified': False, 'reason': 'native_error', 'detail': str(exc)}
+            verification['mode'] = mode
+            verification['reference'] = 'repaired_mesh_before_simplification'
+            item['measured_verification'] = item['verification']
+            item['verification'] = verification
+            item['proof_seconds'] = time.monotonic()-t
+            if verification.get('verified'):
+                verification['max_deviation_mm'] = verification['upper_bound_mm']
+                break
+            item['reason'] = verification.get('reason', 'distance_not_confirmed')
+            best = None
+            if proof_attempt < 2:
+                candidate, info, item = propose(item['error_scale']*.8, 'proof_retry')
+                if candidate is not None:
+                    best = candidate, info, item
+                else:
+                    break
+
+    accepted = exported
+    if best is not None:
+        accepted, info, item = best
+        report['after'] = info
+        summary.update(accepted=True, after=info['triangles'], accepted_attempt=item['attempt'],
+                       error_scale=item['error_scale'], stages=item['stages'], verification=item['verification'])
+    else:
+        item = summary['attempts'][-1]
+        summary['reason'] = item.get('reason', 'native_error')
         summary['reason_ru'] = rd.reason_text(summary['reason'])
+        summary['verification'] = item.get('verification', {})
         emit('Сохранена сетка без упрощения. ' + summary['reason_ru'])
         report['warnings'].append(summary['reason_ru'])
+    summary['elapsed_seconds'] = time.monotonic()-started
     emit(f"Упрощение: {summary['before']:,} → {summary['after']:,} треугольников.")
     report['steps'].append({'name': 'Упрощение', 'elapsed_seconds': summary['elapsed_seconds']})
     return accepted
@@ -712,6 +753,9 @@ def _run(source, settings, emit, progress, folder):
     report['source_deviation'] = source_deviation(reference, exported, mm, settings.quality_mm,
         map_tmp, report['acceleration'], tracker.callback(98, 99, 'Карта отклонения от исходника'), emit)
     report['source_deviation']['heatmap_file'] = str(map_tmp)
+    from .planes import triangle_distribution
+    tracker.update(99, 'Где остались треугольники')
+    report['triangle_distribution'] = triangle_distribution(reference, exported, mm, settings.quality_mm)
     deviation = report['source_deviation']['max_deviation_mm']
     if not math.isfinite(deviation) or deviation > 2*settings.quality_mm:
         report['warnings'].append(f'Отклонение вершин исходника от результата {deviation:.6g} мм больше двух шагов ({2*settings.quality_mm:g} мм). Проверьте места ремонта.')

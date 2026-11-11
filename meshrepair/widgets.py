@@ -171,6 +171,8 @@ class LayoutMixin:
         layout.addWidget(label('02  ПАРАМЕТРЫ РЕМОНТА', 'section'))
         layout.addWidget(label('Качество / допуск'))
         self.quality = DecimalBox()
+        self.quality.setToolTip('Эвристика: допуск ×2,5 может уменьшить число треугольников примерно на 25%. '
+                               'Без перерасчёта; зависит от формы и шума поверхности.')
         self.quality.setLocale(QLocale('ru_RU'))
         self.quality.setRange(.001, .5)
         self.quality.setDecimals(3)

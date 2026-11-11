@@ -31,7 +31,7 @@ def propose_reduction(mesh, mm, settings, progress, error_scale=1.0):
     # A general QEM pass already reduces planar faces. Running a separate
     # planar pass first resets the metric and spends the error budget twice.
     if settings.simplify_curved:
-        requested.append(('curved', None))
+        requested.extend([('curved', None)] * 3)
     elif settings.collapse_coplanar:
         requested.append(('coplanar', settings.coplanar_angle_deg))
     for index, (kind, angle) in enumerate(requested):
@@ -76,10 +76,15 @@ def propose_reduction(mesh, mm, settings, progress, error_scale=1.0):
         progress.update(end, stage)
         stages.append({'kind': kind, 'angle_deg': angle, 'before': before,
                        'after': candidate.topology.numValidFaces(),
+                       'pass': index + 1, 'error_scale': error_scale,
+                       'after_with_protected': candidate.topology.numValidFaces() + (protected.topology.numValidFaces() if protected is not None else 0),
                        'native_error_estimate_mm': float(result.errorIntroduced),
                        'angle_weighted_metric': True, 'protected_components': protected_count,
                        'includes_planar_surfaces': kind == 'curved',
                        'feature_policy': 'ridge_corners' if kind == 'coplanar' else 'surface_tolerance'})
+        if candidate.topology.numValidFaces() > before * .97:
+            stages[-1]['stop_reason'] = 'removed_less_than_three_percent'
+            break
     if protected is not None:
         candidate.addMesh(protected)
     candidate.pack()

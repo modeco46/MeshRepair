@@ -45,7 +45,7 @@ def test_real_cpu_repair_under_one_minute_without_voxels(tmp_path, monkeypatch):
     assert r['algorithm'] == 'local_cut_and_fill'
     assert r['local_repair']['accepted']
     assert r['after']['closed'] and r['after']['topology_valid'] and r['after']['self_intersecting_faces'] == 0
-    assert 30_000 < r['after']['triangles'] < 50_000
+    assert 20_000 < r['after']['triangles'] < 30_000
     assert r['simplification']['accepted']
     assert r['simplification']['verification']['mode'] == 'measured_not_proven'
     assert r['simplification']['verification']['max_deviation_mm'] <= .02
@@ -101,11 +101,13 @@ def test_local_failure_uses_one_full_voxel_pass(tmp_path, monkeypatch):
 def test_adaptive_retry_uses_measured_violation(tmp_path, monkeypatch):
     m = mm.makeCube(); p = mm.SubdivideSettings(); p.maxEdgeLen = .1; mm.subdivideMesh(m,p)
     path = tmp_path/'dense.stl'; mm.saveMesh(m,path)
-    distances = iter([.04, .001])
+    distances = iter([.04, .001, .001, .001, .001, .001])
     monkeypatch.setattr(reduction,'measured_distance',lambda *args: next(distances))
     r = engine.run(path, settings=Settings(.02, True), work_dir=tmp_path/'work')
     attempts = r['simplification']['attempts']
-    assert [a['error_scale'] for a in attempts] == pytest.approx([.25,.1])
+    assert len(attempts) <= 6
+    assert attempts[0]['error_scale'] == pytest.approx(.475)
+    assert attempts[1]['error_scale'] < attempts[0]['error_scale']
     assert attempts[0]['verification']['max_deviation_mm'] == .04
     assert r['simplification']['accepted']
 

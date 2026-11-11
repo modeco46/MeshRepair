@@ -39,7 +39,7 @@ def test_strict_rejection_attempts_and_visible_reason(tmp_path,monkeypatch):
     assert not result['accepted']
     assert 'Исходник → после ремонта → после упрощения' in report_html(report)
     assert result['input_triangles'] == report['before']['triangles']
-    assert [x['max_error_mm'] for x in result['attempts']]==[.005,.0025,.00125]
+    assert [x['max_error_mm'] for x in result['attempts']] == pytest.approx([.0095, .0076, .00608])
     assert 'verification_work_limit' in report_html(report)
     assert Path(report['output']).exists()
 
@@ -47,7 +47,9 @@ def test_strict_rejection_attempts_and_visible_reason(tmp_path,monkeypatch):
 def test_actual_violation_never_uses_measured_fallback(tmp_path,monkeypatch):
     path=tmp_path/'cube.stl';dense(path)
     monkeypatch.setattr(reduction,'verify_surface_bound', lambda *a,**k: {'verified':False,'reason':'sample_exceeds_tolerance'})
-    monkeypatch.setattr(reduction,'measured_distance', lambda *a: pytest.fail('Actual violation must not be ignored'))
+    # Measured search is allowed, but a failed proof must never be accepted
+    # merely because the preliminary vertex measurement passed.
+    monkeypatch.setattr(reduction,'measured_distance', lambda *a: 0.)
     report=run(path,settings=Settings(.02,True,strict_tolerance=True))
     assert not report['simplification']['accepted']
 
