@@ -1,6 +1,7 @@
 """Exercise bundled extension loading and repair without launching a GUI."""
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -83,8 +84,10 @@ if __name__ == '__main__':
         assert report['algorithm'] == 'surface_repair'
         assert report['simplification']['accepted']
 
-        from meshrepair.storage import remove_job
-        remove_job(report['work_directory'])
+        # This standalone harness must not import the source application. The
+        # executable has its own bundled package, while sys.path here starts at
+        # tests/. Clean up the worker's artifacts with the standard library.
+        shutil.rmtree(report['work_directory'])
 
         damaged = mm.Mesh()
         for i in range(40):
