@@ -134,6 +134,7 @@ def test_sharpened_120_degree_wedge(tmp_path):
     assert r['algorithm'] == 'surface_repair'  # All 45 holes now close before voxels.
     assert r['hole_filling']['holes_after'] == 0
     assert r['after']['triangles'] <= 376  # Previous wedge: 342; allow at most +10%.
+    assert any(s['preserved_reduced_corners'] for s in r['simplification']['stages'])
     assert error <= .002
 
 

@@ -384,7 +384,9 @@ def simplify_attempts(exported, tmp, mm, settings, tracker, report, emit, workdi
         summary['attempts'].append(item)
         t = time.monotonic()
         try:
-            candidate, stages = rd.propose_reduction(exported, mm, settings, tracker, error_scale=factor)
+            candidate, stages = rd.propose_reduction(exported, mm, settings, tracker, error_scale=factor,
+                preserve_planar_corners=report.get('algorithm') in {
+                    'surface_repair', 'solid_union', 'closed_components_preserved'})
             item['stages'] = stages
             if candidate.topology.numValidFaces() >= original['triangles']:
                 item['reason'] = 'no_reducible_edges'
