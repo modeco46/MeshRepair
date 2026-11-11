@@ -11,7 +11,6 @@ concurrency:
   cancel-in-progress: true
 jobs:
   test:
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     strategy:
       fail-fast: false
       matrix:
@@ -60,6 +59,6 @@ jobs:
           copy THIRD_PARTY.md dist\MeshRepair\THIRD_PARTY.md
       - uses: actions/upload-artifact@v4
         with:
-          name: MeshRepair-0.9.0-windows-x64
+          name: MeshRepair-0.9.1-windows-x64
           path: dist/MeshRepair/
           retention-days: 30

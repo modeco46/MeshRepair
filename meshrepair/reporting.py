@@ -46,11 +46,26 @@ def report_html(report):
     holes = report.get('hole_filling')
     if holes:
         line(f"Дыры до / после заполнения: {holes['holes_before']} / {holes['holes_after']}; отклонено заплаток: {holes['rejected']}; пропущено: {holes['skipped']}.")
+        if holes.get('accepted_with_local_fix'):
+            line(f"Заплаток принято после локального исправления: {holes['accepted_with_local_fix']}; "
+                 f"пересекающихся граней: {holes['intersections_before_local_fix']} → {holes['intersections_after_local_fix']}.")
+        if holes.get('rolled_back_local_fix'):
+            line(f"Отменено условных заплаток: {holes['rolled_back_local_fix']}; "
+                 f"восстановление безопасных заплаток: {fmt(holes['rollback_seconds'])} с.", 'warning')
     sharp = report.get('sharpening')
     if sharp:
         line('Восстановление острых рёбер: '+('принято' if sharp.get('accepted') else 'отклонено' if sharp.get('requested') else 'выключено'), '' if sharp.get('accepted') else 'warning')
         if sharp.get('reason'):
-            line('Проба с шагом ×4: '+sharp['reason'], 'warning')
+            line(sharp['reason'], 'warning')
+        fallback = sharp.get('fallback')
+        if fallback:
+            line(f"Повтор без Sharpening: оценка {fmt(fallback['estimated_seconds'])} с; "
+                 + (f"затрачено {fmt(fallback['elapsed_seconds'])} с." if fallback['attempted']
+                    else 'ожидается нажатие «Повторить без Sharpening».'))
+    manual = report.get('manual_sharpening_retry')
+    if manual:
+        line('Повтор без Sharpening по кнопке: '+fmt(manual['elapsed_seconds'])+' с.')
+        line(manual['previous_attempt'].get('reason', ''), 'warning')
     local = report.get('local_repair', {})
     if local.get('attempted'):
         section('Локальный ремонт')

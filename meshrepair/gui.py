@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import sys
 import time
+from dataclasses import replace
 from PySide6.QtCore import QTimer, QProcess, QProcessEnvironment, QSettings
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import QApplication, QMainWindow, QFileDialog, QMessageBox, QDialog
@@ -19,7 +20,7 @@ from .reporting import report_html
 class App(QMainWindow, LayoutMixin):
     def __init__(self, *, preview_enabled=True, persist=True):
         super().__init__()
-        self.setWindowTitle('MeshRepair 0.9.0')
+        self.setWindowTitle('MeshRepair 0.9.1')
         self.setMinimumSize(980, 680)
         screen = QApplication.primaryScreen().availableGeometry()
         self.resize(min(1280, screen.width() - 60), min(880, screen.height() - 70))
@@ -41,6 +42,10 @@ class App(QMainWindow, LayoutMixin):
         self.job_result = None
         self.job_directory = self.job_result_file = None
         self.job_error = False
+        self.retry_settings = None
+        self.retry_report = None
+        self.job_retry_report = None
+        self.job_settings = None
         self.setup_ui(preview_enabled and os.environ.get('MESHREPAIR_NO_3D') != '1')
         self.clock = QTimer(self)
         self.clock.setInterval(250)
@@ -131,6 +136,9 @@ class App(QMainWindow, LayoutMixin):
             cleanup_stale(path.parent, legacy=True)
             self.legacy_cleaned.add(path.parent)
         self.source_path = self.view_path = path
+        self.retry_settings = None
+        self.retry_report = None
+        self.retry_button.hide()
         self.result_path = None
         self.reports.clear()
         self.last_repair_report = self.last_check_report = None
@@ -168,22 +176,29 @@ class App(QMainWindow, LayoutMixin):
         self.update_reduction_controls()
         self.save_button.setEnabled(not busy and self.result_path is not None)
         self.repair.setEnabled(not busy and self.source_path is not None)
+        self.retry_button.setEnabled(not busy and self.retry_settings is not None)
         self.check_button.setEnabled(not busy and self.view_path is not None)
         self.source_button.setEnabled(not busy and self.source_path is not None)
         self.result_button.setEnabled(not busy and self.result_path is not None)
         self.stop_button.setEnabled(busy)
         self.heatmap_button.setEnabled(not busy and self.view.heatmap_data is not None)
 
-    def start(self, operation):
+    def retry_without_sharpening(self):
+        if self.retry_settings is not None and not self.is_busy:
+            self.start('repair', settings_override=self.retry_settings)
+
+    def start(self, operation, *, settings_override=None):
         if self.is_busy or self.source_path is None:
             return
         if operation == 'repair' and not self.confirm_unsaved():
             return
         path = self.source_path if operation == 'repair' else self.view_path
-        settings = Settings(self.quality.value(), self.planar.isChecked(), self.angle.value(), self.curved.isChecked(), self.strict.isChecked(), self.weld_close.isChecked(), self.sharp.isChecked(),
+        settings = settings_override or Settings(self.quality.value(), self.planar.isChecked(), self.angle.value(), self.curved.isChecked(), self.strict.isChecked(), self.weld_close.isChecked(), self.sharp.isChecked(),
                             remove_small_shells=self.remove_small.isChecked(), disable_cuda=self.no_cuda.isChecked(),
                             temp_directory=self.temp_folder.text().strip())
         settings.validate()
+        self.job_settings = settings
+        self.job_retry_report = self.retry_report if settings_override is not None else None
         command = ['--worker'] if getattr(sys, 'frozen', False) else ['-u', '-m', 'meshrepair.worker']
         # Preview/check jobs are short-lived; the repair job survives until save/close.
         self.cleanup_job()
@@ -201,6 +216,9 @@ class App(QMainWindow, LayoutMixin):
         elif operation == 'preview':
             command += ['--preview-output', str(self.job_directory / 'view.npz')]
         else:
+            self.retry_settings = None
+            self.retry_report = None
+            self.retry_button.hide()
             command += ['--quality', str(settings.quality_mm)]
             if settings.collapse_coplanar:
                 command += ['--collapse-coplanar', '--coplanar-angle', str(settings.coplanar_angle_deg)]
@@ -285,6 +303,13 @@ class App(QMainWindow, LayoutMixin):
         elif kind == 'error':
             self.job_error = True
             self.write(value)
+        elif kind == 'retry_without_sharpening':
+            self.job_error = True
+            self.write(value['message'])
+            self.retry_settings = replace(self.job_settings, restore_sharp_edges=False)
+            self.retry_report = value['report']
+            self.retry_button.show()
+            self.report_view.setHtml(report_html(value['report']))
         elif kind == 'result':
             self.job_result = value
 
@@ -304,6 +329,8 @@ class App(QMainWindow, LayoutMixin):
                 elif event.get('type') == 'error':
                     self.job_error = True
                     self.write(event['value'])
+                elif event.get('type') == 'retry_without_sharpening':
+                    self.handle_line(json.dumps(event))
             except (ValueError, OSError, KeyError) as exc:
                 self.job_error = True
                 self.write('Не удалось прочитать отчёт рабочего процесса: '+str(exc))
@@ -363,6 +390,11 @@ class App(QMainWindow, LayoutMixin):
             self.write_inspection(report)
             self.status.setText('Проверка завершена. Файл не изменён.')
         else:
+            if self.job_retry_report:
+                report['manual_sharpening_retry'] = {
+                    'previous_attempt': self.job_retry_report.get('sharpening', {}),
+                    'previous_voxel_passes': self.job_retry_report.get('voxel_passes', []),
+                    'elapsed_seconds': report['elapsed_seconds']}
             remove_job(self.result_directory)
             self.result_directory = self.job_directory
             self.job_directory = self.job_result_file = None

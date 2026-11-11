@@ -3,7 +3,7 @@ import argparse
 import json
 import sys
 import traceback
-from .engine import Settings, run, atomic_json, clean_json
+from .engine import Settings, run, atomic_json, clean_json, SharpeningRetryRequired
 
 
 def send(kind, value):
@@ -14,7 +14,7 @@ def main():
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, 'reconfigure'):
             stream.reconfigure(encoding='utf-8', errors='replace')
-    parser = argparse.ArgumentParser(description='MeshRepair 0.9.0 — ремонт сеток')
+    parser = argparse.ArgumentParser(description='MeshRepair 0.9.1 — ремонт сеток')
     parser.add_argument('source')
     parser.add_argument('--output')
     parser.add_argument('--quality', type=float, default=.02)
@@ -63,6 +63,9 @@ def main():
                 release_job(result['work_directory'])
         terminal('result', result)
         return 0
+    except SharpeningRetryRequired as exc:
+        terminal('retry_without_sharpening', {'message': str(exc), 'report': exc.report})
+        return 1
     except Exception as exc:
         message = 'Недостаточно памяти для выбранного качества.' if isinstance(exc, MemoryError) else str(exc)
         terminal('error', message)
