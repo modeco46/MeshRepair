@@ -1,0 +1,53 @@
+{
+  "baseline_commit": "c37380951b79ee1b73cbce5aa74fc4b331983e1f",
+  "candidate_code_commit": "4c9a74d2c0b106b2c723fc10b5b18a495210c34a",
+  "cuda_available": false,
+  "mode": "sequential_single_runs",
+  "settings": {
+    "quality_mm": 0.02,
+    "collapse_coplanar": true,
+    "coplanar_angle_deg": 5,
+    "simplify_curved": true,
+    "disable_cuda": true
+  },
+  "test_stl": [
+    {
+      "version": "0.9.0",
+      "cpu_threads": 1,
+      "elapsed_seconds": 5.999037541,
+      "triangles": 36946,
+      "self_intersecting_faces": 0
+    },
+    {
+      "version": "0.9.1",
+      "cpu_threads": 1,
+      "elapsed_seconds": 5.752524467,
+      "triangles": 36946,
+      "self_intersecting_faces": 0
+    },
+    {
+      "version": "0.9.0",
+      "cpu_threads": 3,
+      "elapsed_seconds": 4.676702528,
+      "triangles": 36894,
+      "self_intersecting_faces": 0
+    },
+    {
+      "version": "0.9.1",
+      "cpu_threads": 3,
+      "elapsed_seconds": 3.960814848,
+      "triangles": 36894,
+      "self_intersecting_faces": 0
+    }
+  ],
+  "uv_sphere": {
+    "cpu_threads": 1,
+    "quality_mm": 0.05,
+    "elapsed_seconds": 5.06,
+    "surface_deviation_mm": 0.034659,
+    "accepted_with_local_fix": 4,
+    "components": 1,
+    "triangles": 76904,
+    "self_intersecting_faces": 0
+  }
+}
