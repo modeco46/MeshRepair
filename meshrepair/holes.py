@@ -56,7 +56,9 @@ def planar_boundary(mesh, mm, loop, points, quality_mm):
 
 def fill_simple_holes(mesh, mm, quality_mm, progress=lambda value: None, emit=lambda text: None,
                       max_diameter_mm=10.0, max_boundary_edges=2048,
-                      max_patch_faces=50000, time_budget_seconds=60.0):
+                      max_patch_faces=50000, time_budget_seconds=60.0,
+                      defer_intersections=False):
+    """Defer colliding patches only when the caller owns repair/rollback."""
     from meshlib import mrmeshnumpy as mn
     started = time.monotonic()
     work = mm.Mesh(mesh)
@@ -64,7 +66,8 @@ def fill_simple_holes(mesh, mm, quality_mm, progress=lambda value: None, emit=la
     report = {'holes_before': len(loops), 'filled': 0, 'rejected': 0, 'skipped': 0,
               'max_diameter_mm': max_diameter_mm, 'max_boundary_edges': max_boundary_edges,
               'max_patch_faces': max_patch_faces, 'time_budget_seconds': time_budget_seconds,
-              'details': []}
+              'pending_local_fix': 0, 'accepted_with_local_fix': 0,
+              'patch_self_intersecting_faces': 0, 'details': []}
     target_edge = max(2*quality_mm, .05)
     for index, edge in enumerate(loops):
         progress(index/max(1, len(loops)))
@@ -111,14 +114,20 @@ def fill_simple_holes(mesh, mm, quality_mm, progress=lambda value: None, emit=la
             if (not patch.count() or remaining >= before_holes or not candidate.topology.checkValidity()
                     or not np.isfinite(mn.getNumpyVerts(candidate)).all()):
                 item['reason'] = 'patch_not_closed'
-            elif patch_collisions(work, candidate, patch, mm).count():
-                item['reason'] = 'patch_self_intersections'
             elif patch.count() > max_patch_faces:
                 item['reason'] = 'patch_work_limit'
             else:
-                work = candidate
-                item.update(accepted=True, patch_triangles=patch.count())
-                report['filled'] += before_holes-remaining
+                collisions = patch_collisions(work, candidate, patch, mm).count()
+                if collisions:
+                    item.update(reason='patch_self_intersections', self_intersecting_faces=collisions)
+                    report['patch_self_intersecting_faces'] += collisions
+                if not collisions or defer_intersections:
+                    work = candidate
+                    item.update(accepted=True, patch_triangles=patch.count())
+                    report['filled'] += before_holes-remaining
+                    if collisions:
+                        item['pending_local_fix'] = True
+                        report['pending_local_fix'] += 1
         except RuntimeError as exc:
             item.update(reason='patch_native_error', detail=str(exc))
         if not item.get('accepted'):

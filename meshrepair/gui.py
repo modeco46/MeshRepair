@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import sys
 import time
+from dataclasses import replace
 from PySide6.QtCore import QTimer, QProcess, QProcessEnvironment, QSettings
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import QApplication, QMainWindow, QFileDialog, QMessageBox, QDialog
@@ -14,12 +15,14 @@ from .theme import STYLE
 from .viewer import PreviewLoader
 from .widgets import LayoutMixin
 from .reporting import report_html
+from .protocol import ProgressTail
+from .runtime import worker_program
 
 
 class App(QMainWindow, LayoutMixin):
     def __init__(self, *, preview_enabled=True, persist=True):
         super().__init__()
-        self.setWindowTitle('MeshRepair 0.9.0')
+        self.setWindowTitle('MeshRepair 0.9.1')
         self.setMinimumSize(980, 680)
         screen = QApplication.primaryScreen().availableGeometry()
         self.resize(min(1280, screen.width() - 60), min(880, screen.height() - 70))
@@ -41,10 +44,18 @@ class App(QMainWindow, LayoutMixin):
         self.job_result = None
         self.job_directory = self.job_result_file = None
         self.job_error = False
+        self.retry_settings = None
+        self.retry_report = None
+        self.job_retry_report = None
+        self.job_settings = None
+        self.job_progress_tail = None
         self.setup_ui(preview_enabled and os.environ.get('MESHREPAIR_NO_3D') != '1')
         self.clock = QTimer(self)
         self.clock.setInterval(250)
         self.clock.timeout.connect(self.update_clock)
+        self.progress_timer = QTimer(self)
+        self.progress_timer.setInterval(200)
+        self.progress_timer.timeout.connect(self.read_progress_file)
         QShortcut(QKeySequence.Open, self, activated=self.pick_source)
         QShortcut(QKeySequence.Save, self, activated=self.save_result)
         if self.preferences:
@@ -131,6 +142,9 @@ class App(QMainWindow, LayoutMixin):
             cleanup_stale(path.parent, legacy=True)
             self.legacy_cleaned.add(path.parent)
         self.source_path = self.view_path = path
+        self.retry_settings = None
+        self.retry_report = None
+        self.retry_button.hide()
         self.result_path = None
         self.reports.clear()
         self.last_repair_report = self.last_check_report = None
@@ -168,22 +182,29 @@ class App(QMainWindow, LayoutMixin):
         self.update_reduction_controls()
         self.save_button.setEnabled(not busy and self.result_path is not None)
         self.repair.setEnabled(not busy and self.source_path is not None)
+        self.retry_button.setEnabled(not busy and self.retry_settings is not None)
         self.check_button.setEnabled(not busy and self.view_path is not None)
         self.source_button.setEnabled(not busy and self.source_path is not None)
         self.result_button.setEnabled(not busy and self.result_path is not None)
         self.stop_button.setEnabled(busy)
         self.heatmap_button.setEnabled(not busy and self.view.heatmap_data is not None)
 
-    def start(self, operation):
+    def retry_without_sharpening(self):
+        if self.retry_settings is not None and not self.is_busy:
+            self.start('repair', settings_override=self.retry_settings)
+
+    def start(self, operation, *, settings_override=None):
         if self.is_busy or self.source_path is None:
             return
         if operation == 'repair' and not self.confirm_unsaved():
             return
         path = self.source_path if operation == 'repair' else self.view_path
-        settings = Settings(self.quality.value(), self.planar.isChecked(), self.angle.value(), self.curved.isChecked(), self.strict.isChecked(), self.weld_close.isChecked(), self.sharp.isChecked(),
+        settings = settings_override or Settings(self.quality.value(), self.planar.isChecked(), self.angle.value(), self.curved.isChecked(), self.strict.isChecked(), self.weld_close.isChecked(), self.sharp.isChecked(),
                             remove_small_shells=self.remove_small.isChecked(), disable_cuda=self.no_cuda.isChecked(),
                             temp_directory=self.temp_folder.text().strip())
         settings.validate()
+        self.job_settings = settings
+        self.job_retry_report = self.retry_report if settings_override is not None else None
         command = ['--worker'] if getattr(sys, 'frozen', False) else ['-u', '-m', 'meshrepair.worker']
         # Preview/check jobs are short-lived; the repair job survives until save/close.
         self.cleanup_job()
@@ -195,12 +216,17 @@ class App(QMainWindow, LayoutMixin):
             self.status.setText('Не удалось создать временную папку.')
             return
         self.job_result_file = self.job_directory / 'worker-result.json'
+        self.job_progress_tail = ProgressTail(self.job_directory / 'progress.jsonl')
         command += [str(path), '--result-file', str(self.job_result_file), '--work-dir', str(self.job_directory)]
+        command += ['--progress-file', str(self.job_progress_tail.path)]
         if operation == 'check':
             command += ['--check']
         elif operation == 'preview':
             command += ['--preview-output', str(self.job_directory / 'view.npz')]
         else:
+            self.retry_settings = None
+            self.retry_report = None
+            self.retry_button.hide()
             command += ['--quality', str(settings.quality_mm)]
             if settings.collapse_coplanar:
                 command += ['--collapse-coplanar', '--coplanar-angle', str(settings.coplanar_angle_deg)]
@@ -244,7 +270,21 @@ class App(QMainWindow, LayoutMixin):
         process.finished.connect(self.worker_finished)
         process.errorOccurred.connect(self.process_error)
         self.process = process
-        process.start(sys.executable, command)
+        if sys.platform == 'win32' and hasattr(process, 'setCreateProcessArgumentsModifier'):
+            def hide_console(arguments):
+                arguments.flags |= 0x08000000  # CREATE_NO_WINDOW
+            process.setCreateProcessArgumentsModifier(hide_console)
+        self.progress_timer.start()
+        process.start(worker_program(), command)
+
+    def read_progress_file(self):
+        if self.job_progress_tail is not None:
+            try:
+                for line in self.job_progress_tail.read():
+                    self.handle_line(line)
+            except OSError as exc:
+                self.write('Не удалось прочитать прогресс: '+str(exc))
+                self.progress_timer.stop()
 
     def process_error(self, error):
         if error == QProcess.FailedToStart:
@@ -258,7 +298,10 @@ class App(QMainWindow, LayoutMixin):
         self.raw_output += bytes(self.process.readAllStandardOutput())
         while b'\n' in self.raw_output:
             line, self.raw_output = self.raw_output.split(b'\n', 1)
-            self.handle_line(line.decode('utf-8', errors='replace').rstrip())
+            # Source CLI workers also emit stdout for external callers. The GUI
+            # consumes protocol events only from the file to avoid duplicates.
+            if self.job_progress_tail is None or not line.startswith(b'{"type":'):
+                self.handle_line(line.decode('utf-8', errors='replace').rstrip())
 
     def handle_line(self, line):
         try:
@@ -285,12 +328,21 @@ class App(QMainWindow, LayoutMixin):
         elif kind == 'error':
             self.job_error = True
             self.write(value)
+        elif kind == 'retry_without_sharpening':
+            self.job_error = True
+            self.write(value['message'])
+            self.retry_settings = replace(self.job_settings, restore_sharp_edges=False)
+            self.retry_report = value['report']
+            self.retry_button.show()
+            self.report_view.setHtml(report_html(value['report']))
         elif kind == 'result':
             self.job_result = value
 
     def worker_finished(self, code, exit_status):
         if self.process is None:
             return
+        self.progress_timer.stop()
+        self.read_progress_file()
         self.read_worker()
         if self.raw_output:
             self.handle_line(self.raw_output.decode('utf-8', errors='replace'))
@@ -304,6 +356,8 @@ class App(QMainWindow, LayoutMixin):
                 elif event.get('type') == 'error':
                     self.job_error = True
                     self.write(event['value'])
+                elif event.get('type') == 'retry_without_sharpening':
+                    self.handle_line(json.dumps(event))
             except (ValueError, OSError, KeyError) as exc:
                 self.job_error = True
                 self.write('Не удалось прочитать отчёт рабочего процесса: '+str(exc))
@@ -363,6 +417,11 @@ class App(QMainWindow, LayoutMixin):
             self.write_inspection(report)
             self.status.setText('Проверка завершена. Файл не изменён.')
         else:
+            if self.job_retry_report:
+                report['manual_sharpening_retry'] = {
+                    'previous_attempt': self.job_retry_report.get('sharpening', {}),
+                    'previous_voxel_passes': self.job_retry_report.get('voxel_passes', []),
+                    'elapsed_seconds': report['elapsed_seconds']}
             remove_job(self.result_directory)
             self.result_directory = self.job_directory
             self.job_directory = self.job_result_file = None
@@ -511,6 +570,8 @@ class App(QMainWindow, LayoutMixin):
         return answer == QMessageBox.Discard
 
     def cleanup_job(self):
+        self.progress_timer.stop()
+        self.job_progress_tail = None
         remove_job(self.job_directory)
         self.job_directory = self.job_result_file = None
 

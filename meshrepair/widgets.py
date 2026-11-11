@@ -146,7 +146,7 @@ class LayoutMixin:
             header.addWidget(frame, 3 if key == 'triangles' else 2)
         self.hardware = label('CPU / CUDA · авто', 'badge')
         header.addWidget(self.hardware)
-        header.addWidget(label('0.9.0', 'muted'))
+        header.addWidget(label('0.9.1', 'muted'))
         outer.addWidget(self.header)
 
         body = QHBoxLayout()
@@ -171,6 +171,8 @@ class LayoutMixin:
         layout.addWidget(label('02  ПАРАМЕТРЫ РЕМОНТА', 'section'))
         layout.addWidget(label('Качество / допуск'))
         self.quality = DecimalBox()
+        self.quality.setToolTip('Эвристика: допуск ×2,5 может уменьшить число треугольников примерно на 25%. '
+                               'Без перерасчёта; зависит от формы и шума поверхности.')
         self.quality.setLocale(QLocale('ru_RU'))
         self.quality.setRange(.001, .5)
         self.quality.setDecimals(3)
@@ -230,6 +232,10 @@ class LayoutMixin:
         footer.setSpacing(10)
         self.repair = button('Исправить сетку', lambda: self.start('repair'), 'primary')
         footer.addWidget(self.repair)
+        self.retry_button = button('Повторить без Sharpening', self.retry_without_sharpening)
+        self.retry_button.setToolTip('Повторить с прежними настройками и обычным воксельным восстановлением.')
+        self.retry_button.hide()
+        footer.addWidget(self.retry_button)
         actions = QHBoxLayout()
         self.check_button = button('Проверить', lambda: self.start('check'))
         self.stop_button = button('Остановить', self.cancel, 'danger')

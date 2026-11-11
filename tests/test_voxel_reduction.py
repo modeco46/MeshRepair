@@ -27,8 +27,8 @@ def test_voxel_slanted_planes_reduce_and_keep_roundtrip_bound(tmp_path):
     params.signDetectionMode = mm.SignDetectionMode.HoleWindingRule
     dense = mm.offsetMesh(mm.MeshPart(mesh), 0, params)
     candidate, stages = reduction.propose_reduction(dense, mm, Settings(.04, True, 25, True), Progress(lambda _: None))
-    # Both checkboxes share one error budget, not two independent passes.
-    assert len(stages) == 1
+    # Both checkboxes share one budget against the original repaired surface.
+    assert 1 <= len(stages) <= 3 and all(s['kind'] == 'curved' for s in stages)
     path = tmp_path/'roundtrip.stl'
     mm.saveMesh(candidate, path)
     candidate = mm.loadMesh(path)

@@ -1,5 +1,7 @@
 """Exercise bundled extension loading and repair without launching a GUI."""
 import json
+import os
+import struct
 from pathlib import Path
 import shutil
 import subprocess
@@ -11,31 +13,44 @@ if __name__ == '__main__':
     if hasattr(sys.stdout, 'reconfigure'):
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     executable = str(Path(sys.argv[1]).resolve())
-    ui = subprocess.run([executable, '--smoke-ui'], capture_output=True, timeout=30)
-    assert ui.returncode == 0, ui.stderr
+    if os.name == 'nt':
+        payload = Path(executable).read_bytes()
+        pe = struct.unpack_from('<I', payload, 0x3c)[0]
+        assert payload[pe:pe+4] == b'PE\0\0'
+        subsystem = struct.unpack_from('<H', payload, pe+24+68)[0]
+        assert subsystem == 2, f'Expected GUI PE subsystem, got {subsystem}'
     with tempfile.TemporaryDirectory() as folder:
-        source = Path(folder) / 'cube.stl'
-        target = Path(folder) / 'result.stl'
+        console_state = Path(folder)/'console.json'
+        ui = subprocess.run([executable, '--smoke-ui', '--console-state', str(console_state)],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=30)
+        assert ui.returncode == 0, ui.stderr
+        if os.name == 'nt':
+            assert json.loads(console_state.read_text())['console_window'] == 0
+        def worker(*arguments):
+            # Unique files ensure every operation supplies its own terminal result.
+            token = len(list(Path(folder).glob('terminal-*.json')))
+            terminal = Path(folder)/f'terminal-{token}.json'
+            progress = Path(folder)/f'progress-{token}.jsonl'
+            p = subprocess.run([executable, '--worker', *map(str, arguments),
+                                '--result-file', str(terminal), '--progress-file', str(progress)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=180)
+            assert p.returncode == 0, p.stderr
+            event = json.loads(terminal.read_text(encoding='utf-8'))
+            assert event['type'] == 'result', event
+            events = [json.loads(line) for line in progress.read_text(encoding='utf-8').splitlines()]
+            assert any(event['type'] == 'progress' for event in events)
+            assert events[-1]['type'] == 'result_file'
+            return event['value']
+        source = Path(folder)/'cube.stl'
+        target = Path(folder)/'result.stl'
         mm.saveMesh(mm.makeCube(mm.Vector3f(.1, .1, .1)), source)
-        p = subprocess.run([executable, '--worker', str(source), '--output', str(target), '--quality', '.02'],
-                           capture_output=True, encoding='utf-8', errors='replace', timeout=180)
-        print(p.stdout)
-        print(p.stderr)
-        assert p.returncode == 0
-        assert target.is_file()
-        report = json.loads(Path(str(target) + '.json').read_text(encoding='utf-8'))
-        assert report['after']['closed']
+        report = worker(source, '--output', target, '--quality', '.02')
+        assert target.is_file() and report['after']['closed']
         assert report['after']['components'] == 1
-
-        checked = subprocess.run([executable, '--worker', str(source), '--check'],
-                                 capture_output=True, encoding='utf-8', errors='replace', timeout=60)
-        assert checked.returncode == 0, checked.stdout + checked.stderr
-        events = [json.loads(line) for line in checked.stdout.splitlines() if line.startswith('{')]
-        assert events[-1]['value']['info']['closed_components'] == 1
-        preview = Path(folder) / 'view.npz'
-        viewed = subprocess.run([executable, '--worker', str(source), '--preview-output', str(preview)],
-                                capture_output=True, encoding='utf-8', errors='replace', timeout=60)
-        assert viewed.returncode == 0, viewed.stdout + viewed.stderr
+        checked = worker(source, '--check')
+        assert checked['info']['closed_components'] == 1
+        preview = Path(folder)/'view.npz'
+        worker(source, '--preview-output', preview)
         assert preview.is_file()
         loaded = subprocess.run([executable, '--smoke-preview', str(preview)], capture_output=True, timeout=60)
         assert loaded.returncode == 0, loaded.stderr
@@ -48,16 +63,10 @@ if __name__ == '__main__':
         mm.subdivideMesh(dense, subdivision)
         mm.saveMesh(dense, source)
         target = Path(folder) / 'simplified.stl'
-        p = subprocess.run([executable, '--worker', str(source), '--output', str(target),
-                            '--quality', '.02', '--collapse-coplanar', '--coplanar-angle', '1',
-                            '--simplify-curved', '--strict-tolerance'], capture_output=True, encoding='utf-8',
-                           errors='replace', timeout=180)
-        print(p.stdout)
-        print(p.stderr)
-        assert p.returncode == 0
-        report = json.loads(Path(str(target) + '.json').read_text(encoding='utf-8'))
+        report = worker(source, '--output', target, '--quality', '.02', '--collapse-coplanar',
+                        '--coplanar-angle', '1', '--simplify-curved', '--strict-tolerance')
         assert report['simplification']['accepted']
-        assert len(report['simplification']['stages']) == 1
+        assert 1 <= len(report['simplification']['stages']) <= 3
         assert report['simplification']['stages'][0]['angle_weighted_metric']
         assert report['simplification']['after'] < report['simplification']['before']
         assert report['simplification']['verification']['upper_bound_mm'] <= .02
@@ -73,11 +82,7 @@ if __name__ == '__main__':
         reversed_source = Path(folder)/'reversed.obj'
         reversed_source.write_text(''.join('v %.9g %.9g %.9g\n' % tuple(v) for v in vertices)+
                                    ''.join('f %d %d %d\n' % tuple(f+1) for f in faces))
-        channel = Path(folder)/'terminal.json'
-        p = subprocess.run([executable,'--worker',str(reversed_source),'--collapse-coplanar',
-                            '--result-file',str(channel)],capture_output=True,encoding='utf-8',errors='replace',timeout=180)
-        assert p.returncode == 0, p.stdout+p.stderr
-        report = json.loads(channel.read_text(encoding='utf-8'))['value']
+        report = worker(reversed_source, '--collapse-coplanar')
         assert report['orientation']['components_before'] > 32
         assert report['prepared']['components'] == 1
         assert report['after']['closed']
@@ -96,12 +101,7 @@ if __name__ == '__main__':
             damaged.addMesh(part)
         mm.saveMesh(damaged, source)
         target = Path(folder) / 'sparse.stl'
-        p = subprocess.run([executable, '--worker', str(source), '--output', str(target), '--quality', '.02'],
-                           capture_output=True, encoding='utf-8', errors='replace', timeout=180)
-        print(p.stdout)
-        print(p.stderr)
-        assert p.returncode == 0
-        report = json.loads(Path(str(target) + '.json').read_text(encoding='utf-8'))
+        report = worker(source, '--output', target, '--quality', '.02')
         assert report['algorithm'] == 'closed_components_preserved'
         assert report['hole_filling']['filled'] == 40
         assert report['source_deviation']['vertex_count'] > 0

@@ -85,3 +85,35 @@ def test_progress_heartbeat(window,monkeypatch):
     w.update_clock()
     assert 'идёт 16 с, этап без процентов' in w.status.text()
     w.process=None
+
+
+def test_retry_without_sharpening_keeps_original_settings(window, monkeypatch):
+    import json
+    from meshrepair.engine import Settings
+    w, _ = window
+    original = Settings(.05, True, 5, True, disable_cuda=True, temp_directory='/tmp/original')
+    w.job_settings = original
+    w.operation = 'repair'
+    event = {'type': 'retry_without_sharpening', 'value': {
+        'message': 'Нажмите «Повторить без Sharpening».',
+        'report': {'before': {'triangles': 12}}}}
+    w.set_busy(True)
+    w.handle_line(json.dumps(event))
+    assert not w.retry_button.isHidden() and not w.retry_button.isEnabled()
+    w.set_busy(False)
+    assert w.retry_button.isEnabled()
+    # Editing controls afterwards must not alter the failed job's snapshot.
+    w.quality.setValue(.2)
+    w.planar.setChecked(False)
+    calls = []
+    monkeypatch.setattr(w, 'start', lambda *args, **kwargs: calls.append((args, kwargs)))
+    w.retry_button.click()
+    assert len(calls) == 1 and calls[0][0] == ('repair',)
+    settings = calls[0][1]['settings_override']
+    assert settings.quality_mm == .05 and settings.collapse_coplanar
+    assert settings.simplify_curved and settings.coplanar_angle_deg == 5
+    assert settings.disable_cuda and settings.temp_directory == original.temp_directory
+    assert not settings.restore_sharp_edges
+    w.unsaved_result = False
+    w.set_source(w.source_path)
+    assert w.retry_settings is None and w.retry_button.isHidden()

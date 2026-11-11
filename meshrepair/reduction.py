@@ -10,7 +10,7 @@ import numpy as np
 from .compute import Projector, cpu_count
 
 
-def propose_reduction(mesh, mm, settings, progress, error_scale=1.0):
+def propose_reduction(mesh, mm, settings, progress, error_scale=1.0, *, preserve_planar_corners=False):
     from meshlib import mrmeshnumpy as mn
     candidate = mm.Mesh(mesh)
     candidate.pack()
@@ -31,7 +31,7 @@ def propose_reduction(mesh, mm, settings, progress, error_scale=1.0):
     # A general QEM pass already reduces planar faces. Running a separate
     # planar pass first resets the metric and spends the error budget twice.
     if settings.simplify_curved:
-        requested.append(('curved', None))
+        requested.extend([('curved', None)] * 3)
     elif settings.collapse_coplanar:
         requested.append(('coplanar', settings.coplanar_angle_deg))
     for index, (kind, angle) in enumerate(requested):
@@ -59,6 +59,16 @@ def propose_reduction(mesh, mm, settings, progress, error_scale=1.0):
             params.bdVerts |= crease_corners(candidate, creases, mm, mn)
             params.notFlippable = creases
             params.collapseNearNotFlippable = True
+        preserve_reduced_corners = (preserve_planar_corners and kind == 'curved' and index > 0 and
+                                    stages[0]['after'] < stages[0]['before']*.1)
+        if preserve_reduced_corners:
+            # A >90% first-pass collapse is typical of triangulated planar
+            # solids. Reinitializing QEM on their few remaining faces can let
+            # sharp junctions drift even when the tolerance is much larger.
+            # The caller enables this for surface repairs only; voxel seam
+            # vertices must remain free to remove reconstruction artifacts.
+            creases = mm.findCreaseEdges(candidate.topology, candidate.points, math.radians(45))
+            params.bdVerts |= crease_corners(candidate, creases, mm, mn)
         # General simplification is controlled by the distance to the complete
         # repaired surface, not by locking voxel-generated normal discontinuities.
         params.subdivideParts = min(os.cpu_count() or 1, cpu_count(), max(1, before // 25_000))
@@ -76,10 +86,16 @@ def propose_reduction(mesh, mm, settings, progress, error_scale=1.0):
         progress.update(end, stage)
         stages.append({'kind': kind, 'angle_deg': angle, 'before': before,
                        'after': candidate.topology.numValidFaces(),
+                       'pass': index + 1, 'error_scale': error_scale,
+                       'preserved_reduced_corners': preserve_reduced_corners,
+                       'after_with_protected': candidate.topology.numValidFaces() + (protected.topology.numValidFaces() if protected is not None else 0),
                        'native_error_estimate_mm': float(result.errorIntroduced),
                        'angle_weighted_metric': True, 'protected_components': protected_count,
                        'includes_planar_surfaces': kind == 'curved',
                        'feature_policy': 'ridge_corners' if kind == 'coplanar' else 'surface_tolerance'})
+        if candidate.topology.numValidFaces() > before * .97:
+            stages[-1]['stop_reason'] = 'removed_less_than_three_percent'
+            break
     if protected is not None:
         candidate.addMesh(protected)
     candidate.pack()

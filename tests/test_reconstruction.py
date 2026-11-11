@@ -133,7 +133,8 @@ def test_sharpened_120_degree_wedge(tmp_path):
     print('wedge', r['after']['triangles'], error, r.get('sharpening'))
     assert r['algorithm'] == 'surface_repair'  # All 45 holes now close before voxels.
     assert r['hole_filling']['holes_after'] == 0
-    assert r['after']['triangles'] <= 1000
+    assert r['after']['triangles'] <= 376  # Previous wedge: 342; allow at most +10%.
+    assert any(s['preserved_reduced_corners'] for s in r['simplification']['stages'])
     assert error <= .002
 
 
@@ -249,7 +250,9 @@ def test_sharpening_preserves_closed_wedge_crease():
     report={'warnings':[]}
     dense=sparse_repair(ideal,mm,Settings(.05),Progress(lambda _:None),report,lambda _:None)
     assert report['sharpening']['accepted']
-    candidate,_=propose_reduction(dense,mm,Settings(.05,True,25,True),Progress(lambda _:None))
+    # Exercise the first scale actually used by the binary search, rather than
+    # the primitive's unvalidated maximum-error default of 1.0.
+    candidate,_=propose_reduction(dense,mm,Settings(.05,True,25,True),Progress(lambda _:None), error_scale=.475)
     info=diagnostics(candidate,mm)
     assert info['closed'] and info['self_intersecting_faces']==0
     assert info['triangles']<=1000
