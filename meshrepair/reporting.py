@@ -145,6 +145,7 @@ def report_html(report):
     cap = report.get('acceleration', {})
     line(f"CPU: {cap.get('cpu_threads','авто')} доступных потоков; топология, булевы операции и decimation — нативный CPU.")
     line('Ориентация: NumPy + SciPy (нативный граф, без Python BFS).')
-    line('Восстановление: '+{'cpu_native_parallel':'нативный CPU','cuda_winding_with_cpu_openvdb':'CUDA winding + CPU OpenVDB'}.get(report.get('compute_device'),'не выполнялось'))
+    line('Восстановление: '+{'cpu_native_parallel':'нативный CPU','cuda_winding_with_cpu_openvdb':'CUDA winding + CPU OpenVDB',
+                           'cuda_winding_with_cpu_marching_cubes':'CUDA winding + CPU Marching Cubes по частям'}.get(report.get('compute_device'),'не выполнялось'))
     line('Проекции: '+', '.join(cap.get('projection_backends', [])) if cap.get('projection_backends') else 'Проекции: нативный CPU для измерений; CUDA при доступности для строгой проверки.')
     return '\n'.join(lines)

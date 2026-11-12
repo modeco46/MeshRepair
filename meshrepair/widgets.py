@@ -5,6 +5,7 @@ from PySide6.QtWidgets import (QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxL
     QFrame, QDoubleSpinBox, QCheckBox, QProgressBar, QPlainTextEdit, QSplitter,
     QTabWidget, QTableView, QHeaderView, QScrollArea, QSizePolicy, QLineEdit)
 from .viewer import MeshView
+from . import __version__
 
 
 def label(text, name=None, wrap=False):
@@ -146,7 +147,7 @@ class LayoutMixin:
             header.addWidget(frame, 3 if key == 'triangles' else 2)
         self.hardware = label('CPU / CUDA · авто', 'badge')
         header.addWidget(self.hardware)
-        header.addWidget(label('0.9.1', 'muted'))
+        header.addWidget(label(__version__, 'muted'))
         outer.addWidget(self.header)
 
         body = QHBoxLayout()

@@ -17,12 +17,13 @@ from .widgets import LayoutMixin
 from .reporting import report_html
 from .protocol import ProgressTail
 from .runtime import worker_program
+from . import __version__
 
 
 class App(QMainWindow, LayoutMixin):
     def __init__(self, *, preview_enabled=True, persist=True):
         super().__init__()
-        self.setWindowTitle('MeshRepair 0.9.1')
+        self.setWindowTitle('MeshRepair '+__version__)
         self.setMinimumSize(980, 680)
         screen = QApplication.primaryScreen().availableGeometry()
         self.resize(min(1280, screen.width() - 60), min(880, screen.height() - 70))

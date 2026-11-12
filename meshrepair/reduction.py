@@ -6,12 +6,15 @@ triangle (both directions), rather than merely checking distances at mesh vertic
 import math
 import os
 import ctypes
+import time
 import numpy as np
 from .compute import Projector, cpu_count
 
 
-def propose_reduction(mesh, mm, settings, progress, error_scale=1.0, *, preserve_planar_corners=False):
+def propose_reduction(mesh, mm, settings, progress, error_scale=1.0, *, preserve_planar_corners=False,
+                      emit=lambda message: None):
     from meshlib import mrmeshnumpy as mn
+    progress.update(78, 'Подготовка оболочек к упрощению')
     candidate = mm.Mesh(mesh)
     candidate.pack()
     # Parallel decimation must not even receive the tiny shells. bdVerts alone
@@ -24,8 +27,16 @@ def propose_reduction(mesh, mm, settings, progress, error_scale=1.0, *, preserve
     protected = candidate.cloneRegion(small) if small.count() else None
     if small.count() == candidate.topology.numValidFaces():
         return candidate, []
-    if protected is not None:
-        candidate = candidate.cloneRegion(candidate.topology.getValidFaces() - small)
+    # A face-count threshold alone cannot protect shells: a physically tiny
+    # shell can have thousands of faces and disappear in the FIRST QEM pass.
+    # Give each connected component its own deletion budget, including on
+    # subsequent passes. Four faces must remain in every closed component.
+    large_ids = np.flatnonzero(sizes >= 50)
+    components = ([candidate] if count == 1 else
+                  [candidate.cloneRegion(mn.faceBitSetFromBools(groups == i)) for i in large_ids])
+    del candidate
+    protected_faces = protected.topology.numValidFaces() if protected is not None else 0
+    first_pass_counts = []
     stages = []
     requested = []
     # A general QEM pass already reduces planar faces. Running a separate
@@ -33,73 +44,112 @@ def propose_reduction(mesh, mm, settings, progress, error_scale=1.0, *, preserve
     if settings.simplify_curved:
         requested.extend([('curved', None)] * 3)
     elif settings.collapse_coplanar:
-        requested.append(('coplanar', settings.coplanar_angle_deg))
+        requested.extend([('coplanar', settings.coplanar_angle_deg)] * 3)
     for index, (kind, angle) in enumerate(requested):
-        before = candidate.topology.numValidFaces()
-        candidate.packOptimally(False)
-        params = mm.DecimateSettings()
-        # The SDK's maxError is an estimate. Acceptance is decided by the
-        # independent distance check on the candidate in memory.
-        params.maxError = settings.quality_mm * error_scale
-        params.maxAngleChange = -1  # this property controls edge FLIPS, not coplanarity
-        params.tinyEdgeLength = 0
-        params.optimizeVertexPos = kind != 'coplanar'
-        # Angle weighting reduces artificial dependence of QEM on local
-        # triangulation density (in particular the dense voxel seam bands).
-        params.angleWeightedDistToPlane = True
-        params.stabilizer = 0.0 if kind == 'coplanar' else 1e-6
-        params.touchBdVerts = False
-        params.touchNearBdEdges = True
-        params.bdVerts = candidate.topology.findBdVerts()
-        if kind == 'coplanar':
-            creases = mm.findCreaseEdges(candidate.topology, candidate.points,
-                                        max(math.radians(angle), 1e-7))
-            # Keep junctions/corners, but allow collinear ridge vertices to
-            # disappear. Locking every crease vertex leaves a dense seam belt.
-            params.bdVerts |= crease_corners(candidate, creases, mm, mn)
-            params.notFlippable = creases
-            params.collapseNearNotFlippable = True
-        preserve_reduced_corners = (preserve_planar_corners and kind == 'curved' and index > 0 and
-                                    stages[0]['after'] < stages[0]['before']*.1)
-        if preserve_reduced_corners:
-            # A >90% first-pass collapse is typical of triangulated planar
-            # solids. Reinitializing QEM on their few remaining faces can let
-            # sharp junctions drift even when the tolerance is much larger.
-            # The caller enables this for surface repairs only; voxel seam
-            # vertices must remain free to remove reconstruction artifacts.
-            creases = mm.findCreaseEdges(candidate.topology, candidate.points, math.radians(45))
-            params.bdVerts |= crease_corners(candidate, creases, mm, mn)
-        # General simplification is controlled by the distance to the complete
-        # repaired surface, not by locking voxel-generated normal discontinuities.
-        params.subdivideParts = min(os.cpu_count() or 1, cpu_count(), max(1, before // 25_000))
+        before = sum(part.topology.numValidFaces() for part in components)
+        started = time.monotonic()
         start, end = 78 + 7 * index / len(requested), 78 + 7 * (index + 1) / len(requested)
         stage = 'Схлопывание плоских участков' if kind == 'coplanar' else 'Упрощение всей поверхности в пределах допуска'
+        stage += f': проход {index + 1}/{len(requested)}'
         progress.update(start, stage)
-        # MeshLib 3.1.4.297 Python callbacks from parallel decimation workers
-        # deadlock on the GIL. Keep native parallelism, but report only stage
-        # boundaries here. The separate UI process still supports immediate Stop.
-        if params.subdivideParts == 1:
-            params.progressCallback = progress.callback(start, end, stage)
-        result = mm.decimateMesh(candidate, params)
-        if result.cancelled:
-            raise RuntimeError('Упрощение прервано.')
+        emit(f'{stage}; треугольников {before:,}; оболочек {len(components)}.')
+        details, completed = [], 0
+        for component_index, candidate in enumerate(components):
+            part_before = candidate.topology.numValidFaces()
+            preserve_corners = (preserve_planar_corners and kind == 'curved' and index > 0 and
+                                first_pass_counts[component_index][1] < first_pass_counts[component_index][0]*.1)
+            detail = _decimate_component(candidate, mm, mn, settings, kind, angle, error_scale,
+                preserve_corners, progress, start + (end-start)*completed/before,
+                start + (end-start)*(completed+part_before)/before, stage)
+            details.append(detail)
+            completed += part_before
+            if index == 0:
+                first_pass_counts.append((part_before, detail['after']))
+        after = sum(part.topology.numValidFaces() for part in components)
         progress.update(end, stage)
-        stages.append({'kind': kind, 'angle_deg': angle, 'before': before,
-                       'after': candidate.topology.numValidFaces(),
+        stages.append({'kind': kind, 'angle_deg': angle, 'before': before, 'after': after,
                        'pass': index + 1, 'error_scale': error_scale,
-                       'preserved_reduced_corners': preserve_reduced_corners,
-                       'after_with_protected': candidate.topology.numValidFaces() + (protected.topology.numValidFaces() if protected is not None else 0),
-                       'native_error_estimate_mm': float(result.errorIntroduced),
+                       'preserved_reduced_corners': any(d['preserved_reduced_corners'] for d in details),
+                       'after_with_protected': after + protected_faces,
+                       'native_error_estimate_mm': max(d['native_error_estimate_mm'] for d in details),
                        'angle_weighted_metric': True, 'protected_components': protected_count,
+                       'component_count': len(components) + protected_count,
+                       'component_passes': details, 'elapsed_seconds': time.monotonic()-started,
                        'includes_planar_surfaces': kind == 'curved',
                        'feature_policy': 'ridge_corners' if kind == 'coplanar' else 'surface_tolerance'})
-        if candidate.topology.numValidFaces() > before * .97:
+        emit(f'{stage}: {before:,} → {after:,}; {stages[-1]["elapsed_seconds"]:.2f} с; '
+             f'участков на оболочку до {max(d["subdivide_parts"] for d in details)}.')
+        if after > before * .97:
             stages[-1]['stop_reason'] = 'removed_less_than_three_percent'
             break
+    candidate = components[0]
+    for part in components[1:]:
+        candidate.addMesh(part)
     if protected is not None:
         candidate.addMesh(protected)
     candidate.pack()
     return candidate, stages
+
+
+def _decimate_component(candidate, mm, mn, settings, kind, angle, error_scale,
+                        preserve_corners, progress, start, end, stage):
+    before = candidate.topology.numValidFaces()
+    candidate.packOptimally(False)
+    params = mm.DecimateSettings()
+    params.maxDeletedFaces = max(0, before - 4)
+    # The SDK's maxError is an estimate. Acceptance is decided by the
+    # independent distance check on the candidate in memory.
+    params.maxError = settings.quality_mm * error_scale
+    params.maxAngleChange = -1  # this property controls edge FLIPS, not coplanarity
+    params.tinyEdgeLength = 0
+    params.optimizeVertexPos = kind != 'coplanar'
+    # Angle weighting reduces artificial dependence of QEM on local
+    # triangulation density (in particular the dense voxel seam bands).
+    params.angleWeightedDistToPlane = True
+    params.stabilizer = 0.0 if kind == 'coplanar' else 1e-6
+    params.touchBdVerts = False
+    params.touchNearBdEdges = True
+    params.bdVerts = candidate.topology.findBdVerts()
+    if kind == 'coplanar':
+        creases = mm.findCreaseEdges(candidate.topology, candidate.points,
+                                    max(math.radians(angle), 1e-7))
+        # Keep junctions/corners, but allow collinear ridge vertices to
+        # disappear. Locking every crease vertex leaves a dense seam belt.
+        params.bdVerts |= crease_corners(candidate, creases, mm, mn)
+        params.notFlippable = creases
+        params.collapseNearNotFlippable = True
+    if preserve_corners:
+        # A >90% first-pass collapse is typical of triangulated planar
+        # solids. Reinitializing QEM on their few remaining faces can let
+        # sharp junctions drift even when the tolerance is much larger.
+        # The caller enables this for surface repairs only; voxel seam
+        # vertices must remain free to remove reconstruction artifacts.
+        creases = mm.findCreaseEdges(candidate.topology, candidate.points, math.radians(45))
+        params.bdVerts |= crease_corners(candidate, creases, mm, mn)
+    # General simplification is controlled by the distance to the complete
+    # repaired surface, not by locking voxel-generated normal discontinuities.
+    # In 3.1.4.297 the parallel path replaces bdVerts with partition
+    # boundaries, ignoring caller-specified corners and open boundaries.
+    # Keep constrained passes global. Unconstrained closed shells still
+    # use native parallelism, with its final inter-part cleanup enabled.
+    constrained = kind == 'coplanar' or params.bdVerts.count() > 0
+    # The pinned partition setup scans the whole mesh for each part. Bound
+    # that overhead on many-core machines instead of growing it with size.
+    params.subdivideParts = (1 if constrained else
+        min(8, os.cpu_count() or 1, cpu_count(), max(1, before // 25_000)))
+    params.decimateBetweenParts = True
+    # MeshLib 3.1.4.297 Python callbacks from parallel decimation workers
+    # deadlock on the GIL. Keep native parallelism, but report only stage
+    # boundaries here. The separate UI process still supports immediate Stop.
+    if params.subdivideParts == 1:
+        params.progressCallback = progress.callback(start, end, stage)
+    result = mm.decimateMesh(candidate, params)
+    if result.cancelled:
+        raise RuntimeError('Упрощение прервано.')
+    return {'before': before, 'after': candidate.topology.numValidFaces(),
+            'subdivide_parts': params.subdivideParts, 'fixed_vertices': params.bdVerts.count(),
+            'preserved_reduced_corners': preserve_corners,
+            'native_error_estimate_mm': float(result.errorIntroduced)}
 
 
 

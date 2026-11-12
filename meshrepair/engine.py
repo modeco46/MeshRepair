@@ -8,6 +8,12 @@ import tempfile
 import time
 import numpy as np
 from .compute import capabilities, cuda_module
+from . import __version__
+
+
+# offsetMesh(HoleWindingRule) densifies its entire bounding box in the pinned
+# SDK. Above this size, use native marching cubes by layers/chunks instead.
+DENSE_WINDING_VOXEL_LIMIT = 64_000_000
 
 
 @dataclass(frozen=True)
@@ -159,8 +165,19 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
     report['voxel_estimate'] = {'triangles': estimate, 'method': 'area_over_step_squared',
                               'estimated_seconds': estimated_seconds,
                               'seconds_per_million': 90.0}
+    box_size = mesh.computeBoundingBox().size()
+
+    def grid_estimate(step):
+        dimensions = [math.ceil(value / step) + 4 for value in (box_size.x, box_size.y, box_size.z)]
+        return dimensions, math.prod(dimensions)
+
+    dimensions, grid_voxels = grid_estimate(settings.quality_mm)
+    report['voxel_estimate'].update(grid_dimensions=dimensions, grid_voxels=grid_voxels,
+        dense_float_grid_bytes=grid_voxels*4, streaming_threshold_voxels=DENSE_WINDING_VOXEL_LIMIT)
     emit(f'Оценка воксельной поверхности: ≈ {estimate:,} треугольников (площадь / шаг²); '
          'время зависит от CPU, CUDA и формы. На одном CPU для 2 млн граней — порядка 3 минут.')
+    emit(f'Объём сетки: {dimensions[0]} × {dimensions[1]} × {dimensions[2]} = {grid_voxels:,} вокселей; '
+         f'только одно плотное поле float ≈ {grid_voxels*4/1024**3:.2f} ГиБ (без служебных данных).')
     winding = None
     try:
         cuda = None if settings.disable_cuda else cuda_module()
@@ -176,17 +193,35 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
         params.voxelSize = step
         params.signDetectionMode = mm.SignDetectionMode.HoleWindingRule
         stage = 'Проба острых рёбер (шаг ×4)' if probe else 'Восстановление поверхности'
-        params.callBack = tracker.callback(32 if probe else 42, 41 if probe else 65, stage)
-        params.fwn = winding
+        _, voxels = grid_estimate(step)
+        streaming = voxels > DENSE_WINDING_VOXEL_LIMIT
+        # An external non-chunked winding implementation disables the SDK's
+        # memory-efficient FunctionVolume. Never feed it to the large path.
+        params.fwn = (winding if not streaming or isinstance(winding, mm.IFastWindingNumberByParts)
+                      else None)
+        params.memoryEfficient = True
         if sharpen:
             params.mode = mm.GeneralOffsetParametersMode.Sharpening
-        operation = mm.generalOffsetMesh if sharpen else mm.offsetMesh
-        device = 'cuda_winding_with_cpu_openvdb' if winding is not None else 'cpu_native_parallel'
+        operation = mm.generalOffsetMesh if sharpen else mm.mcOffsetMesh if streaming else mm.offsetMesh
+        backend = 'marching_cubes_by_parts' if streaming else 'sharpening' if sharpen else 'smooth_openvdb'
+        start, end = (32, 41) if probe else (42, 65)
+        if not sharpen and not streaming:
+            # Exact phase boundaries in MeshLib 3.1.4.297 offsetMesh. Report
+            # the expensive winding phase separately from distance/meshing.
+            def callback(value):
+                phase = ('поле расстояний' if value < .33 else
+                         'определение внутреннего объёма' if value < .66 else 'извлечение поверхности')
+                return tracker.update(start+(end-start)*value, stage+': '+phase)
+            params.callBack = callback
+        else:
+            params.callBack = tracker.callback(start, end, stage+(' (по слоям)' if streaming else ''))
+        device = ('cuda_winding_with_cpu_marching_cubes' if streaming else 'cuda_winding_with_cpu_openvdb') if params.fwn is not None else 'cpu_native_parallel'
         report['compute_device'] = device
-        item = {'probe': probe, 'sharpening': sharpen, 'voxel_size_mm': step, 'compute_device': device}
+        item = {'probe': probe, 'sharpening': sharpen, 'voxel_size_mm': step, 'compute_device': device,
+                'backend': backend, 'grid_voxels': voxels, 'streaming': streaming}
         report['voxel_passes'].append(item)
         started = time.monotonic()
-        emit(f'{stage}: шаг {step:g} мм; compute_device={device}.')
+        emit(f'{stage}: шаг {step:g} мм; backend={backend}; compute_device={device}.')
         try:
             try:
                 return operation(mm.MeshPart(mesh), 0, params)
@@ -386,7 +421,7 @@ def simplify_attempts(exported, tmp, mm, settings, tracker, report, emit, workdi
         try:
             candidate, stages = rd.propose_reduction(exported, mm, settings, tracker, error_scale=factor,
                 preserve_planar_corners=report.get('algorithm') in {
-                    'surface_repair', 'solid_union', 'closed_components_preserved'})
+                    'surface_repair', 'solid_union', 'closed_components_preserved'}, emit=emit)
             item['stages'] = stages
             if candidate.topology.numValidFaces() >= original['triangles']:
                 item['reason'] = 'no_reducible_edges'
@@ -416,6 +451,8 @@ def simplify_attempts(exported, tmp, mm, settings, tracker, report, emit, workdi
         finally:
             item['elapsed_seconds'] = time.monotonic()-t
             emit(f"Упрощение, попытка {item['attempt']}: {item['elapsed_seconds']:.2f} с; compute_device=cpu_native_parallel.")
+            if item.get('reason'):
+                emit(f"Попытка {item['attempt']} отклонена: {rd.reason_text(item['reason'])}")
         return None, None, item
 
     best = None
@@ -550,12 +587,12 @@ def _run(source, settings, emit, progress, folder):
     from .orientation import prepare_orientation, finite_vertices
     from .inspection import describe_mesh
     started = time.monotonic()
-    report = {'version': '0.9.1', 'settings': asdict(settings), 'source': str(source),
+    report = {'version': __version__, 'settings': asdict(settings), 'source': str(source),
               'units': 'mm', 'tolerance_certified': False, 'warnings': [], 'steps': [],
               'compute_device': 'cpu_native_parallel', 'acceleration': capabilities(settings.disable_cuda)}
     report['stage_timings'] = []
     tracker = Progress(progress, emit, report['stage_timings'],
-        lambda stage: report['compute_device'] if stage in {'Проба острых рёбер (шаг ×4)', 'Восстановление поверхности'}
+        lambda stage: report['compute_device'] if stage.startswith(('Проба острых рёбер', 'Восстановление поверхности'))
         else ','.join(report['acceleration'].get('projection_backends', ['cpu_native_parallel']))
         if stage == 'Карта отклонения от исходника' or stage.startswith('Строгая проверка') else 'cpu_native_parallel')
     emit('compute_device=cpu_native_parallel; CUDA '+('выключена настройкой.' if settings.disable_cuda else 'авто.'))
