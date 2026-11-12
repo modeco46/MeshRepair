@@ -11,10 +11,9 @@ import numpy as np
 from .compute import Projector, cpu_count
 
 
-def propose_reduction(mesh, mm, settings, progress, error_scale=1.0, *, preserve_planar_corners=False,
-                      emit=lambda message: None):
+def prepare_reduction(mesh, mm):
+    """Split the immutable reference once, rather than once per search attempt."""
     from meshlib import mrmeshnumpy as mn
-    progress.update(78, 'Подготовка оболочек к упрощению')
     candidate = mm.Mesh(mesh)
     candidate.pack()
     # Parallel decimation must not even receive the tiny shells. bdVerts alone
@@ -25,16 +24,27 @@ def propose_reduction(mesh, mm, settings, progress, error_scale=1.0, *, preserve
     small = mn.faceBitSetFromBools(sizes[groups] < 50)
     protected_count = int(np.count_nonzero(sizes < 50))
     protected = candidate.cloneRegion(small) if small.count() else None
-    if small.count() == candidate.topology.numValidFaces():
-        return candidate, []
     # A face-count threshold alone cannot protect shells: a physically tiny
     # shell can have thousands of faces and disappear in the FIRST QEM pass.
     # Give each connected component its own deletion budget, including on
     # subsequent passes. Four faces must remain in every closed component.
     large_ids = np.flatnonzero(sizes >= 50)
-    components = ([candidate] if count == 1 else
+    components = ([candidate] if count == 1 and len(large_ids) else
                   [candidate.cloneRegion(mn.faceBitSetFromBools(groups == i)) for i in large_ids])
-    del candidate
+    return {'components': components, 'protected': protected, 'protected_count': protected_count}
+
+
+def propose_reduction(mesh, mm, settings, progress, error_scale=1.0, *, preserve_planar_corners=False,
+                      emit=lambda message: None, prepared=None, checkpoint=None, component_tolerance=None):
+    from meshlib import mrmeshnumpy as mn
+    progress.update(78, 'Подготовка оболочек к упрощению')
+    prepared = prepare_reduction(mesh, mm) if prepared is None else prepared
+    components = [mm.Mesh(part) for part in prepared['components']]
+    protected, protected_count = prepared['protected'], prepared['protected_count']
+    if not components:
+        return mm.Mesh(mesh), []
+    largest = max(range(len(components)), key=lambda i: components[i].topology.numValidFaces())
+    frozen = {}
     protected_faces = protected.topology.numValidFaces() if protected is not None else 0
     first_pass_counts = []
     stages = []
@@ -58,9 +68,36 @@ def propose_reduction(mesh, mm, settings, progress, error_scale=1.0, *, preserve
             part_before = candidate.topology.numValidFaces()
             preserve_corners = (preserve_planar_corners and kind == 'curved' and index > 0 and
                                 first_pass_counts[component_index][1] < first_pass_counts[component_index][0]*.1)
-            detail = _decimate_component(candidate, mm, mn, settings, kind, angle, error_scale,
-                preserve_corners, progress, start + (end-start)*completed/before,
-                start + (end-start)*(completed+part_before)/before, stage)
+            # A thin satellite can drift far along its plane despite a small
+            # QEM estimate. Its failure must not discard a good main body.
+            # The largest component and inter-component collisions are checked
+            # by the complete-mesh checkpoint below, against the same reference.
+            check_component = component_tolerance is not None and component_index != largest
+            previous = mm.Mesh(candidate) if check_component else None
+            if component_index in frozen:
+                detail = dict(frozen[component_index], before=part_before, after=part_before)
+            else:
+                detail = _decimate_component(candidate, mm, mn, settings, kind, angle, error_scale,
+                    preserve_corners, progress, start + (end-start)*completed/before,
+                    start + (end-start)*(completed+part_before)/before, stage)
+                if check_component:
+                    reference = prepared['components'][component_index]
+                    reason = None
+                    if (candidate.topology.isClosed() != reference.topology.isClosed() or
+                            not candidate.topology.checkValidity() or
+                            mm.MeshComponents.getNumComponents(mm.MeshPart(candidate)) != 1 or
+                            mm.findSelfCollidingTrianglesBS(mm.MeshPart(candidate)).count()):
+                        reason = 'component_topology_changed'
+                    else:
+                        deviation = measured_distance(reference, candidate, mm)
+                        detail['measured_deviation_mm'] = deviation
+                        if not math.isfinite(deviation) or deviation > component_tolerance:
+                            reason = 'component_exceeds_tolerance'
+                    if reason:
+                        components[component_index] = previous
+                        detail.update(reverted_reason=reason, proposed_after=detail['after'], after=part_before)
+                        frozen[component_index] = detail.copy()
+                        emit(f'Оболочка {component_index+1}: сохранён предыдущий проход [{reason}].')
             details.append(detail)
             completed += part_before
             if index == 0:
@@ -79,16 +116,25 @@ def propose_reduction(mesh, mm, settings, progress, error_scale=1.0, *, preserve
                        'feature_policy': 'ridge_corners' if kind == 'coplanar' else 'surface_tolerance'})
         emit(f'{stage}: {before:,} → {after:,}; {stages[-1]["elapsed_seconds"]:.2f} с; '
              f'участков на оболочку до {max(d["subdivide_parts"] for d in details)}.')
+        if checkpoint is not None:
+            # Own the snapshot: later native passes mutate components in place.
+            snapshot = _assemble_components(components, protected, mm)
+            if not checkpoint(snapshot, list(stages)):
+                break
         if after > before * .97:
             stages[-1]['stop_reason'] = 'removed_less_than_three_percent'
             break
-    candidate = components[0]
+    return _assemble_components(components, protected, mm), stages
+
+
+def _assemble_components(components, protected, mm):
+    candidate = mm.Mesh(components[0])
     for part in components[1:]:
         candidate.addMesh(part)
     if protected is not None:
         candidate.addMesh(protected)
     candidate.pack()
-    return candidate, stages
+    return candidate
 
 
 def _decimate_component(candidate, mm, mn, settings, kind, angle, error_scale,

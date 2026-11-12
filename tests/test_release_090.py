@@ -101,8 +101,10 @@ def test_local_failure_uses_one_full_voxel_pass(tmp_path, monkeypatch):
 def test_adaptive_retry_uses_measured_violation(tmp_path, monkeypatch):
     m = mm.makeCube(); p = mm.SubdivideSettings(); p.maxEdgeLen = .1; mm.subdivideMesh(m,p)
     path = tmp_path/'dense.stl'; mm.saveMesh(m,path)
-    distances = iter([.04, .001, .001, .001, .001, .001])
-    monkeypatch.setattr(reduction,'measured_distance',lambda *args: next(distances))
+    distances = iter([.04])
+    # Every later candidate/pass is within tolerance; the number of distance
+    # checks is allowed to grow when intermediate passes are validated.
+    monkeypatch.setattr(reduction,'measured_distance',lambda *args: next(distances, .001))
     r = engine.run(path, settings=Settings(.02, True), work_dir=tmp_path/'work')
     attempts = r['simplification']['attempts']
     assert len(attempts) <= 6
