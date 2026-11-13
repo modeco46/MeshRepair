@@ -10,7 +10,8 @@ import numpy as np
 from .compute import Projector, cpu_count
 
 
-def propose_reduction(mesh, mm, settings, progress, error_scale=1.0, *, preserve_planar_corners=False):
+def prepare_reduction(mesh, mm):
+    """Cache immutable topology groups once for the complete tolerance search."""
     from meshlib import mrmeshnumpy as mn
     candidate = mm.Mesh(mesh)
     candidate.pack()
@@ -23,9 +24,20 @@ def propose_reduction(mesh, mm, settings, progress, error_scale=1.0, *, preserve
     protected_count = int(np.count_nonzero(sizes < 50))
     protected = candidate.cloneRegion(small) if small.count() else None
     if small.count() == candidate.topology.numValidFaces():
-        return candidate, []
-    if protected is not None:
+        candidate = None
+    if candidate is not None and protected is not None:
         candidate = candidate.cloneRegion(candidate.topology.getValidFaces() - small)
+    return {'candidate': candidate, 'protected': protected, 'protected_count': protected_count}
+
+
+def propose_reduction(mesh, mm, settings, progress, error_scale=1.0, *, preserve_planar_corners=False,
+                      checkpoint=None, prepared=None):
+    from meshlib import mrmeshnumpy as mn
+    prepared = prepare_reduction(mesh, mm) if prepared is None else prepared
+    if prepared['candidate'] is None:
+        return mm.Mesh(mesh), []
+    candidate = mm.Mesh(prepared['candidate'])
+    protected, protected_count = prepared['protected'], prepared['protected_count']
     stages = []
     requested = []
     # A general QEM pass already reduces planar faces. Running a separate
@@ -71,7 +83,11 @@ def propose_reduction(mesh, mm, settings, progress, error_scale=1.0, *, preserve
             params.bdVerts |= crease_corners(candidate, creases, mm, mn)
         # General simplification is controlled by the distance to the complete
         # repaired surface, not by locking voxel-generated normal discontinuities.
-        params.subdivideParts = min(os.cpu_count() or 1, cpu_count(), max(1, before // 25_000))
+        # Partitioned decimation locks the partition seams: with crease protection a perfect 6.3M-triangle cube
+        # ended with 252 instead of 12 triangles. The general (curved) pass is not affected (40 vs 34), so only
+        # the planar pass runs unpartitioned.
+        params.subdivideParts = 1 if kind == 'coplanar' else \
+            min(os.cpu_count() or 1, cpu_count(), max(1, before // 25_000))
         start, end = 78 + 7 * index / len(requested), 78 + 7 * (index + 1) / len(requested)
         stage = 'Схлопывание плоских участков' if kind == 'coplanar' else 'Упрощение всей поверхности в пределах допуска'
         progress.update(start, stage)
@@ -93,6 +109,14 @@ def propose_reduction(mesh, mm, settings, progress, error_scale=1.0, *, preserve
                        'angle_weighted_metric': True, 'protected_components': protected_count,
                        'includes_planar_surfaces': kind == 'curved',
                        'feature_policy': 'ridge_corners' if kind == 'coplanar' else 'surface_tolerance'})
+        if checkpoint is not None:
+            # A retained snapshot must not share subsequent native mutations.
+            snapshot = mm.Mesh(candidate)
+            if protected is not None:
+                snapshot.addMesh(protected)
+            snapshot.pack()
+            if not checkpoint(snapshot, list(stages)):
+                break
         if candidate.topology.numValidFaces() > before * .97:
             stages[-1]['stop_reason'] = 'removed_less_than_three_percent'
             break
@@ -322,6 +346,57 @@ def face_neighbors(faces):
 
 class ProjectionLayoutError(ValueError):
     """Pinned native ABI differs; never silently degrade to a Python loop."""
+
+
+def propose_reduction_by_shell(mesh, mm, settings, progress, error_scale=1.0, *, preserve_planar_corners=False,
+                               min_faces=200):
+    """Decimate every large shell on its own; shells below min_faces stay untouched.
+
+    A whole-mesh pass can collapse a tiny shell or press two neighbouring shells into each other, and the caller
+    then rejects the entire simplification. Per-shell passes keep the shell count by construction and a shell
+    whose reduced copy is not a single closed positive solid without self-intersections simply keeps its original."""
+    source = mm.Mesh(mesh)
+    source.pack()
+    regions = sorted(mm.MeshComponents.getAllComponents(mm.MeshPart(source)), key=lambda region: -region.count())
+    merged = mm.Mesh()
+    per_shell, kept = [], 0
+    for index, region in enumerate(regions):
+        part = source.cloneRegion(region)
+        reduced, stages, note = part, [], None
+        box = part.computeBoundingBox()
+        diagonal = float((box.max - box.min).length())
+        # A shell cannot be simplified by more than a fraction of its own size without ceasing to be a solid.
+        scale = min(error_scale, 0.15*diagonal/settings.quality_mm)
+        if region.count() >= min_faces and scale >= 0.01:
+            try:
+                reduced, stages = propose_reduction(part, mm, settings, progress, scale,
+                                                    preserve_planar_corners=preserve_planar_corners)
+                collisions = mm.findSelfCollidingTrianglesBS(mm.MeshPart(reduced)).count()
+                single = mm.MeshComponents.getNumComponents(mm.MeshPart(reduced)) == 1
+                if not (reduced.topology.isClosed() and single and not collisions and reduced.volume() > 0):
+                    reduced, stages, note = part, [], 'kept_original_invalid_reduction'
+            except (RuntimeError, MemoryError):
+                reduced, stages, note = part, [], 'kept_original_native_error'
+        else:
+            note = 'kept_small_shell'
+        kept += note is not None
+        per_shell.append((region.count(), reduced.topology.numValidFaces(), stages, note))
+        merged.addMesh(reduced)
+    passes = max((len(stages) for _, _, stages, _ in per_shell), default=0)
+    aggregated = []
+    for number in range(passes):
+        template = next(stages[number] for _, _, stages, _ in per_shell if len(stages) > number)
+        before = after = 0
+        for original, final, stages, _ in per_shell:
+            if len(stages) > number:
+                before += stages[number]['before']
+                after += stages[number]['after']
+            else:   # shell finished earlier or was kept: it contributes its current size
+                before += stages[-1]['after'] if stages else original
+                after += stages[-1]['after'] if stages else original
+        aggregated.append(dict(template, before=before, after=after, shells=len(per_shell),
+                               shells_kept_unreduced=int(kept)))
+    return merged, aggregated
 
 
 def projection_arrays(projections, mm):

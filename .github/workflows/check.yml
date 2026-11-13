@@ -59,6 +59,6 @@ jobs:
           copy THIRD_PARTY.md dist\MeshRepair\THIRD_PARTY.md
       - uses: actions/upload-artifact@v4
         with:
-          name: MeshRepair-0.9.1-windows-x64
+          name: MeshRepair-1.0.0-windows-x64
           path: dist/MeshRepair/
           retention-days: 30

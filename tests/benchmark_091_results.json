@@ -19,7 +19,7 @@
       "self_intersecting_faces": 0
     },
     {
-      "version": "0.9.1",
+      "commit": "49bbc1e",
       "cpu_threads": 1,
       "elapsed_seconds": 5.752524467,
       "triangles": 36946,
@@ -33,7 +33,7 @@
       "self_intersecting_faces": 0
     },
     {
-      "version": "0.9.1",
+      "commit": "49bbc1e",
       "cpu_threads": 3,
       "elapsed_seconds": 3.960814848,
       "triangles": 36894,

@@ -66,6 +66,23 @@ def report_html(report):
     if manual:
         line('Повтор без Sharpening по кнопке: '+fmt(manual['elapsed_seconds'])+' с.')
         line(manual['previous_attempt'].get('reason', ''), 'warning')
+    union = report.get('union_attempt', {})
+    if union.get('attempted') or union.get('reason'):
+        section('Объединение оболочек')
+        if union.get('accepted'):
+            line(f"✓ Пересечения только между оболочками ({fmt(union['pairs_between_shells'])} пар): "
+                 f"булево объединение без вокселей за {fmt(union['elapsed_seconds'])} с.")
+        else:
+            reasons = {'intersections_inside_shell': 'есть пересечения внутри одной оболочки',
+                       'union_failed': 'булева операция не удалась или превысила лимит времени',
+                       'union_invalid': 'результат объединения не прошёл проверку',
+                       'too_many_intersections': 'слишком много пересечений', 'no_pairs': 'пересечения не найдены'}
+            line('Булево объединение не применено: '+reasons.get(union.get('reason'), str(union.get('reason'))), 'warning')
+    estimate = report.get('voxel_estimate')
+    if estimate and estimate.get('grid'):
+        grid = '×'.join(str(v) for v in estimate['grid'])
+        timing = f"; оценка по пробе ≈ {fmt(estimate['estimated_seconds'])} с" if estimate.get('estimated_seconds') else ''
+        line(f"Воксельная сетка {grid} ≈ {fmt(estimate['cells']/1e6)} млн ячеек{timing}.")
     local = report.get('local_repair', {})
     if local.get('attempted'):
         section('Локальный ремонт')
@@ -79,6 +96,10 @@ def report_html(report):
             line(f"После CutAndFill: максимум {fmt(deviation['max_deviation_mm'])} мм; "
                  f"вершин > {fmt(deviation['warning_threshold_mm'])} мм: {deviation['exceeding_vertices']}.")
             line('Наихудшая точка исходника: '+', '.join(fmt(v) for v in deviation['top10'][0]['coordinates_mm'])+' мм.')
+    cavities = report.get('removed_cavities', [])
+    if cavities:
+        line(f"Удалено внутренних полостей и пластин нулевой толщины: {len(cavities)} "
+             f"({fmt(sum(item['triangles'] for item in cavities))} граней). Полости внутри детали не сохраняются.", 'warning')
     for shell in report.get('removed_shells', []):
         line(f"Удалена мелкая оболочка: {shell['triangles']} граней, центр {shell['center_mm']} мм.", 'warning')
     after = report.get('after')
@@ -88,6 +109,9 @@ def report_html(report):
         line('Объём: '+fmt(after.get('signed_volume_mm3'))+' мм³')
         deviation = report.get('source_deviation', {})
         line('Макс. отклонение исходник → результат: '+fmt(deviation.get('max_deviation_mm'))+' мм (измерено по вершинам исходника, не доказано для всей поверхности).')
+        if deviation.get('interior_vertices'):
+            line(f"Вершин исходника внутри тела результата (внутренние поверхности, не считаются отклонением): "
+                 f"{fmt(deviation['interior_vertices'])}, до {fmt(deviation['interior_max_deviation_mm'])} мм.")
         if deviation.get('top10'):
             line(f"Вершин с отклонением > двух шагов: {deviation.get('exceeding_vertices', 0)}. Кнопка «Отклонения» показывает карту в 3D.", 'warning' if deviation.get('exceeding_vertices') else '')
             line('Наибольшие отклонения — координаты исходника в мм:')

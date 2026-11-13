@@ -28,11 +28,11 @@ def main():
         if p.returncode:
             raise RuntimeError(p.stdout + p.stderr)
         report = json.loads(Path(str(output) + '.json').read_text(encoding='utf-8'))
-        # Intersections now deliberately take the voxel route. A 1-micron grid
-        # on these 20-mm spheres would benchmark enormous output allocation,
-        # not the old surface boolean. Keep the CI fixture explicitly bounded.
+        # 1.0.0: closed shells that only cross each other are merged by an exact boolean union (no voxels).
+        # The voxel route and its fallback are covered by tests/test_v100.py; a 1-micron grid on these 20-mm
+        # spheres would benchmark enormous output allocation, so the fixture stays bounded (0.1 mm).
         assert report['settings']['quality_mm'] == .1
-        assert report['algorithm'] == 'sparse_openvdb_winding'
+        assert report['algorithm'] == 'solid_union' and report['union_attempt']['accepted']
         assert report['after']['closed'] and report['after']['self_intersecting_faces'] == 0
         print(json.dumps({key: report[key] for key in ['before', 'after', 'elapsed_seconds',
                          'algorithm', 'compute_device', 'settings', 'source_deviation']}, indent=2))
