@@ -158,7 +158,14 @@ def test_planar_only_pass_is_not_partitioned(monkeypatch):
 def test_voxel_estimate_uses_grid_cells_and_a_timed_probe(monkeypatch):
     mesh = mm.makeCube(mm.Vector3f(5, 5, 5), mm.Vector3f(0, 0, 0))
     steps = []
-    operation = lambda part, offset, params: steps.append(params.voxelSize) or mm.makeCube()
+    # A fake mesher may finish inside one Windows clock tick. Advance a
+    # controlled clock so this checks the estimate, not timer resolution.
+    clock = [0.0]
+    monkeypatch.setattr(engine.time, 'monotonic', lambda: clock[0])
+    def operation(part, offset, params):
+        steps.append(params.voxelSize)
+        clock[0] += .25
+        return mm.makeCube()
     monkeypatch.setattr(mm, 'offsetMesh', operation)
     monkeypatch.setattr(mm, 'mcOffsetMesh', operation)
     report = {'warnings': []}
@@ -166,7 +173,8 @@ def test_voxel_estimate_uses_grid_cells_and_a_timed_probe(monkeypatch):
     engine.sparse_repair(mm.Mesh(mesh), mm, settings, Progress(lambda _: None), report, lambda _: None)
     estimate = report['voxel_estimate']
     assert estimate['grid'] == [502, 502, 502] and estimate['cells'] == pytest.approx(502**3)
-    assert estimate['estimated_seconds'] is not None and estimate['probe_seconds'] >= 0
+    assert estimate['probe_seconds'] == pytest.approx(.25)
+    assert estimate['estimated_seconds'] == pytest.approx(.25*estimate['cells']/estimate['probe_cells'])
     assert steps[0] == pytest.approx(.04) and steps[-1] == pytest.approx(.01)
     assert report['voxel_passes'][0]['timing'] and any('Допуск' in w for w in report['warnings'])
 
