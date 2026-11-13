@@ -176,6 +176,8 @@ def test_voxel_estimate_uses_grid_cells_and_a_timed_probe(monkeypatch):
     assert estimate['probe_seconds'] == pytest.approx(.25)
     assert estimate['estimated_seconds'] == pytest.approx(.25*estimate['cells']/estimate['probe_cells'])
     assert steps[0] == pytest.approx(.04) and steps[-1] == pytest.approx(.01)
+    assert report['voxel_passes'][0]['backend'] == report['voxel_passes'][-1]['backend']
+    assert report['voxel_passes'][0]['streaming']  # calibrate the full-grid backend even on the coarse grid
     assert report['voxel_passes'][0]['timing'] and any('Допуск' in w for w in report['warnings'])
 
 

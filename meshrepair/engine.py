@@ -284,7 +284,11 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
         stage = stage or ('Проба острых рёбер (шаг ×4)' if probe else 'Восстановление поверхности')
         start, end = span or ((32, 41) if probe else (42, 65))
         grid_cells = math.prod(grid_for(step))
-        streaming = grid_cells > DENSE_WINDING_VOXEL_LIMIT
+        timing = stage.startswith('Оценка времени')
+        # Calibrate the backend selected for the full grid. Otherwise a small
+        # dense OpenVDB probe can predict hours for a much faster streamed run.
+        streaming = (grid_cells > DENSE_WINDING_VOXEL_LIMIT or
+                     (timing and cells > DENSE_WINDING_VOXEL_LIMIT))
         # Non-chunked external winding disables the SDK's FunctionVolume.
         params.fwn = (winding if not streaming or isinstance(winding, mm.IFastWindingNumberByParts)
                       else None)
@@ -299,7 +303,7 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
         device = ('cuda_winding_with_cpu_marching_cubes' if streaming else 'cuda_winding_with_cpu_openvdb') if params.fwn is not None else 'cpu_native_parallel'
         report['compute_device'] = device
         item = {'probe': probe, 'sharpening': sharpen, 'voxel_size_mm': step, 'compute_device': device,
-                'timing': stage.startswith('Оценка времени'), 'backend': backend, 'streaming': streaming,
+                'timing': timing, 'backend': backend, 'streaming': streaming,
                 'grid_cells': grid_cells, 'cpu_closed_surface_band': narrow_band}
         report['voxel_passes'].append(item)
         started = time.monotonic()
