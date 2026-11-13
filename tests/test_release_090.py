@@ -50,8 +50,15 @@ def test_real_cpu_repair_under_one_minute_without_voxels(tmp_path, monkeypatch):
     assert r['simplification']['verification']['mode'] == 'measured_not_proven'
     assert r['simplification']['verification']['max_deviation_mm'] <= .02
     assert r['elapsed_seconds'] < 60
-    assert r['source_deviation']['max_deviation_mm'] == pytest.approx(.091, abs=.002)
-    np.testing.assert_allclose(r['source_deviation']['top10'][0]['coordinates_mm'], [3.15,3.2,3.2], atol=.15)
+    deviation = r['source_deviation']
+    # the folded spike lies inside the solid: it is reported separately, not as shape deviation (1.0.0)
+    assert deviation['max_deviation_all_mm'] == pytest.approx(.091, abs=.002)
+    assert deviation['interior_max_deviation_mm'] == pytest.approx(.091, abs=.002)
+    assert 0 < deviation['interior_vertices'] < 100 and deviation['interior_classified']
+    # the part of the fold that stays outside the result is still a real (small) deviation: two vertices
+    assert deviation['max_deviation_mm'] == pytest.approx(.068, abs=.006)
+    assert deviation['exceeding_vertices'] == 2
+    np.testing.assert_allclose(deviation['top10'][0]['coordinates_mm'], [3.12, 3.17, 3.21], atol=.12)
     assert reads == ['test.stl', 'result.stl'] and writes == ['result.stl']
     assert sorted(p.name for p in (tmp_path/'job').iterdir()) == ['deviation.npz', 'result.stl']
     assert list(source.parent.iterdir()) == [source]
@@ -75,7 +82,9 @@ def test_real_sharpening_probe_rejects_before_full_calculation(real_mesh, monkey
     monkeypatch.setattr(mm, 'offsetMesh', plain)
     r = {'warnings': []}
     engine.sparse_repair(mm.Mesh(real_mesh), mm, Settings(disable_cuda=True), Progress(lambda _: None), r, lambda _: None)
-    assert [kind for kind, _ in steps] == ['sharp', 'plain']
+    # 1.0.0: a 64x cheaper plain pass first calibrates the voxel time, then the sharp probe, then the real pass
+    assert steps[0] == ('plain', pytest.approx(.08))
+    assert [kind for kind, _ in steps[1:]] == ['sharp', 'plain']
     assert steps[-1][1] == pytest.approx(.02)
     assert not r['sharpening']['accepted']
     assert r['sharpening']['probe']['self_intersecting_faces'] > 0
@@ -91,7 +100,9 @@ def test_local_failure_uses_one_full_voxel_pass(tmp_path, monkeypatch):
     def offset(part, value, params):
         calls.append(params.voxelSize); return native(part, value, params)
     monkeypatch.setattr(mm, 'offsetMesh', offset)
-    r = engine.run(source, settings=Settings(.1, restore_sharp_edges=False, disable_cuda=True), work_dir=tmp_path/'work')
+    # the two closed cubes only cross each other, which 1.0.0 merges by a boolean union; switch that off here
+    r = engine.run(source, settings=Settings(.1, restore_sharp_edges=False, disable_cuda=True, union_max_seconds=0.0),
+                   work_dir=tmp_path/'work')
     assert r['local_repair']['attempted'] and not r['local_repair']['accepted']
     assert r['algorithm'] == 'sparse_openvdb_winding'
     assert calls == pytest.approx([.1])
@@ -101,8 +112,8 @@ def test_local_failure_uses_one_full_voxel_pass(tmp_path, monkeypatch):
 def test_adaptive_retry_uses_measured_violation(tmp_path, monkeypatch):
     m = mm.makeCube(); p = mm.SubdivideSettings(); p.maxEdgeLen = .1; mm.subdivideMesh(m,p)
     path = tmp_path/'dense.stl'; mm.saveMesh(m,path)
-    distances = iter([.04, .001, .001, .001, .001, .001])
-    monkeypatch.setattr(reduction,'measured_distance',lambda *args: next(distances))
+    distances = iter([.04])
+    monkeypatch.setattr(reduction,'measured_distance',lambda *args: next(distances, .001))
     r = engine.run(path, settings=Settings(.02, True), work_dir=tmp_path/'work')
     attempts = r['simplification']['attempts']
     assert len(attempts) <= 6

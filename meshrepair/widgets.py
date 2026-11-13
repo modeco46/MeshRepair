@@ -146,7 +146,7 @@ class LayoutMixin:
             header.addWidget(frame, 3 if key == 'triangles' else 2)
         self.hardware = label('CPU / CUDA · авто', 'badge')
         header.addWidget(self.hardware)
-        header.addWidget(label('0.9.1', 'muted'))
+        header.addWidget(label('1.0.0', 'muted'))
         outer.addWidget(self.header)
 
         body = QHBoxLayout()

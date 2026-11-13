@@ -98,7 +98,7 @@ def test_full_sharpening_failure_runs_plain_offset_end_to_end(tmp_path, monkeypa
         # ownership/reuse without requiring a physical CUDA device.
         return mm.FastWindingNumber(mesh)
     monkeypatch.setattr(engine, 'cuda_module', lambda: SimpleNamespace(FastWindingNumber=winding))
-    settings = Settings(.1, local_fix_max_faces=0, local_fix_fraction=0, disable_cuda=not cuda)
+    settings = Settings(.1, local_fix_max_faces=0, local_fix_fraction=0, disable_cuda=not cuda, union_max_seconds=0)
     report = engine.run(source, settings=settings, work_dir=tmp_path/'job')
     assert [x[0] for x in calls] == ['sharp', 'sharp', 'plain']
     assert [x[1] for x in calls] == pytest.approx([.4, .1, .1])
@@ -121,7 +121,7 @@ def test_expensive_sharpening_retry_is_deferred_end_to_end(tmp_path, monkeypatch
     calls = []
     mock_full_sharpening_failure(monkeypatch, calls)
     settings = Settings(.1, local_fix_max_faces=0, local_fix_fraction=0, disable_cuda=True,
-                        sharpening_fallback_max_seconds=0)
+                        sharpening_fallback_max_seconds=0, union_max_seconds=0)
     with pytest.raises(SharpeningRetryRequired, match='Повторить без Sharpening') as error:
         engine.run(source, settings=settings, work_dir=tmp_path/'job')
     assert [x[0] for x in calls] == ['sharp', 'sharp']
@@ -209,7 +209,7 @@ def test_cuda_failure_stays_on_cpu_for_sharpening_retry(tmp_path, monkeypatch):
         return mm.FastWindingNumber(mesh)
     monkeypatch.setattr(engine, 'cuda_module', lambda: SimpleNamespace(FastWindingNumber=winding))
     monkeypatch.setattr(mm, 'generalOffsetMesh', fail_gpu)
-    report = engine.run(source, settings=Settings(.1, local_fix_max_faces=0, local_fix_fraction=0),
+    report = engine.run(source, settings=Settings(.1, local_fix_max_faces=0, local_fix_fraction=0, union_max_seconds=0),
                         work_dir=tmp_path/'job')
     assert initializations == failures == [True]
     assert [x[0] for x in calls] == ['sharp', 'sharp', 'plain']
